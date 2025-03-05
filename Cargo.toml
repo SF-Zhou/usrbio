@@ -1,0 +1,12 @@
+[package]
+name = "usrbio"
+version = "0.1.0"
+edition = "2021"
+authors = ["SF-Zhou <sfzhou.scut@gmail.com>"]
+homepage = "https://github.com/SF-Zhou/usrbio"
+repository = "https://github.com/SF-Zhou/usrbio"
+description = "Rust bindings for the [3FS USRBIO API](https://github.com/deepseek-ai/3FS/blob/main/src/lib/api/UsrbIo.md)."
+license = "MIT OR Apache-2.0"
+
+[build-dependencies]
+bindgen = "0.71"
