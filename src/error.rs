@@ -18,7 +18,8 @@ impl Error {
             | Error::CretateIovFailed(errno)
             | Error::PrepareIOFailed(errno)
             | Error::SubmitIOsFailed(errno)
-            | Error::WaitForIOsFailed(errno) => *errno,
+            | Error::WaitForIOsFailed(errno)
+            | Error::WriteFailed(errno) => *errno,
             _ => 22,
         }
     }

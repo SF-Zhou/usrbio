@@ -149,7 +149,7 @@ impl Ring {
         }
 
         if cqes[0].result < 0 {
-            return Err(Error::WaitForIOsFailed(-cqes[0].result as _));
+            return Err(Error::WriteFailed(-cqes[0].result as _));
         }
 
         Ok(cqes[0].result as _)
