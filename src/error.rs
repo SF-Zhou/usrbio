@@ -5,12 +5,20 @@ pub enum Error {
     RegisterFileFailed,
     CretateIorFailed(i32),
     CretateIovFailed(i32),
+    PrepareIOFailed(i32),
+    SubmitIOsFailed(i32),
+    WaitForIOsFailed(i32),
+    WriteFailed(i32),
 }
 
 impl Error {
     pub fn errno(&self) -> i32 {
         match self {
-            Error::CretateIorFailed(errno) | Error::CretateIovFailed(errno) => *errno,
+            Error::CretateIorFailed(errno)
+            | Error::CretateIovFailed(errno)
+            | Error::PrepareIOFailed(errno)
+            | Error::SubmitIOsFailed(errno)
+            | Error::WaitForIOsFailed(errno) => *errno,
             _ => 22,
         }
     }

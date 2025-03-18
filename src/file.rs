@@ -14,17 +14,7 @@ pub struct File {
 
 impl File {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<File> {
-        let f = fs::File::open(&path).map_err(Error::OpenFileFailed)?;
-        Self::register_file(&f)?;
-        let realpath = path
-            .as_ref()
-            .canonicalize()
-            .map_err(|_| Error::ExtractMountPointFailed)?;
-        let mount_point = Self::extract_mount_point(&realpath)?;
-        Ok(Self {
-            file: f,
-            mount_point,
-        })
+        fs::OpenOptions::new().read(true).open_3fs_file(path)
     }
 
     pub fn mount_point(&self) -> &Path {
@@ -78,5 +68,30 @@ impl Deref for File {
 impl DerefMut for File {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.file
+    }
+}
+
+pub trait Open3fsFile {
+    fn open_3fs_file<P: AsRef<Path>>(&self, path: P) -> Result<File>
+    where
+        Self: Sized;
+}
+
+impl Open3fsFile for fs::OpenOptions {
+    fn open_3fs_file<P: AsRef<Path>>(&self, path: P) -> Result<File>
+    where
+        Self: Sized,
+    {
+        let f = self.open(&path).map_err(Error::OpenFileFailed)?;
+        File::register_file(&f)?;
+        let realpath = path
+            .as_ref()
+            .canonicalize()
+            .map_err(|_| Error::ExtractMountPointFailed)?;
+        let mount_point = File::extract_mount_point(&realpath)?;
+        Ok(File {
+            file: f,
+            mount_point,
+        })
     }
 }

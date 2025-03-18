@@ -3,7 +3,7 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 mod file;
-pub use file::File;
+pub use file::{File, Open3fsFile};
 
 mod error;
 pub use error::{Error, Result};

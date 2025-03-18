@@ -71,4 +71,26 @@ fn test() {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
+
+    let path = test_dir.join("write.txt");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open_3fs_file(&path)
+        .unwrap();
+    let config = RingConfig {
+        for_read: false,
+        ..Default::default()
+    };
+    let ring = Ring::create(&config, &mount_point).unwrap();
+    let buf = b"hello world!";
+    let ret = ring.write(&file, buf, 0).unwrap();
+    assert_eq!(ret, buf.len());
+    let ret = ring.write(&file, b"\n", buf.len() as _).unwrap();
+    assert_eq!(ret, 1);
+    drop(file);
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(content, "hello world!\n");
 }

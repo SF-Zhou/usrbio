@@ -1,5 +1,5 @@
 use crate::*;
-use std::{ffi::c_void, ops::Deref, os::fd::AsRawFd, path::Path};
+use std::{ffi::c_void, ops::Deref, os::fd::AsRawFd, path::Path, ptr::null_mut};
 
 #[derive(Debug, Clone)]
 pub struct RingConfig {
@@ -106,6 +106,53 @@ impl Ring {
         let buf = unsafe { std::slice::from_raw_parts(self.iov.base, self.config.buf_size) };
         cqes.sort_by_key(|cqe| cqe.userdata as usize);
         (job.callback)(&job.jobs, buf, cqes);
+    }
+
+    pub fn write(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize> {
+        assert!(buf.len() <= self.config.buf_size);
+        let slice = unsafe { std::slice::from_raw_parts_mut(self.iov.base, buf.len()) };
+        slice.copy_from_slice(buf);
+
+        let ret = unsafe {
+            hf3fs_prep_io(
+                self.ior.deref(),
+                self.iov.deref(),
+                false,
+                self.iov.base as _,
+                file.as_raw_fd(),
+                offset as usize,
+                buf.len() as u64,
+                null_mut(),
+            )
+        };
+        if ret < 0 {
+            return Err(Error::PrepareIOFailed(-ret));
+        }
+
+        let ret = unsafe { hf3fs_submit_ios(self.ior.deref()) };
+        if ret != 0 {
+            return Err(Error::SubmitIOsFailed(-ret));
+        }
+
+        let mut cqes = [hf3fs_cqe::default()];
+        let ret = unsafe {
+            hf3fs_wait_for_ios(
+                self.ior.deref(),
+                cqes.as_mut_ptr(),
+                cqes.len() as _,
+                cqes.len() as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            return Err(Error::WaitForIOsFailed(-ret));
+        }
+
+        if cqes[0].result < 0 {
+            return Err(Error::WaitForIOsFailed(-cqes[0].result as _));
+        }
+
+        Ok(cqes[0].result as _)
     }
 
     #[inline(always)]
