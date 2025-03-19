@@ -9,6 +9,7 @@ pub enum Error {
     SubmitIOsFailed(i32),
     WaitForIOsFailed(i32),
     WriteFailed(i32),
+    InvalidArgument,
 }
 
 impl Error {
