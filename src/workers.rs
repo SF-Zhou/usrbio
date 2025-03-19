@@ -20,6 +20,6 @@ impl ReadWorkers {
 
     pub fn enqueue(&self, job: BatchReadJob) {
         let index = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.workers[index].enqueue(job);
+        self.workers[index % self.workers.len()].enqueue(job);
     }
 }
