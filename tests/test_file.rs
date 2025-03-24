@@ -66,6 +66,7 @@ fn test() {
             }),
         };
         let workers = ReadWorkers::start(&config, 2).unwrap();
+        println!("workers: {:#?}", workers);
         workers.enqueue(job);
         while !finish.load(std::sync::atomic::Ordering::Acquire) {
             std::thread::sleep(std::time::Duration::from_millis(100));

@@ -30,3 +30,13 @@ impl ReadWorkers {
         self.workers[0].config()
     }
 }
+
+impl std::fmt::Debug for ReadWorkers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadWorkers")
+            .field("config", &self.config())
+            .field("num_threads", &self.workers.len())
+            .field("index", &self.index)
+            .finish()
+    }
+}
