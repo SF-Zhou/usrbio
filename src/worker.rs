@@ -11,7 +11,10 @@ impl ReadWorker {
     pub fn start(config: &RingConfig) -> Result<Self> {
         let (sender, receiver) = mpsc::channel::<BatchReadJob>();
         let config_clone = config.clone();
-        let handle = std::thread::spawn(move || Self::process(config_clone, receiver));
+        let handle = std::thread::Builder::new()
+            .name("ReadWorker".to_string())
+            .spawn(move || Self::process(config_clone, receiver))
+            .unwrap();
 
         Ok(Self {
             config: config.clone(),

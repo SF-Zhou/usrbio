@@ -29,7 +29,6 @@ fn test() {
     let file = Arc::new(file);
 
     {
-        let len = len;
         let content = content.clone();
         let read_job = ReadJob {
             file: file.clone(),
@@ -48,7 +47,6 @@ fn test() {
     }
 
     {
-        let len = len;
         let content = content.clone();
         let read_job = ReadJob {
             file: file.clone(),
