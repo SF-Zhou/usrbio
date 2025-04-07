@@ -13,6 +13,14 @@ pub struct File {
 }
 
 impl File {
+    /// # Safety
+    ///
+    /// Ensure the mount_point is correct.
+    pub unsafe fn new(file: fs::File, mount_point: PathBuf) -> Result<File> {
+        File::register_file(&file)?;
+        Ok(File { file, mount_point })
+    }
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<File> {
         fs::OpenOptions::new().read(true).open_3fs_file(path)
     }
@@ -83,15 +91,11 @@ impl Open3fsFile for fs::OpenOptions {
         Self: Sized,
     {
         let f = self.open(&path).map_err(Error::OpenFileFailed)?;
-        File::register_file(&f)?;
         let realpath = path
             .as_ref()
             .canonicalize()
             .map_err(|_| Error::ExtractMountPointFailed)?;
         let mount_point = File::extract_mount_point(&realpath)?;
-        Ok(File {
-            file: f,
-            mount_point,
-        })
+        unsafe { File::new(f, mount_point) }
     }
 }
