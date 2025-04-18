@@ -31,14 +31,14 @@ impl File {
 
     fn register_file(file: &fs::File) -> Result<()> {
         let ret = unsafe { super::hf3fs_reg_fd(file.as_raw_fd(), 0) };
-        if ret == 0 {
+        if ret > 0 {
             Err(Error::RegisterFileFailed)
         } else {
             Ok(())
         }
     }
 
-    fn extract_mount_point(path: &Path) -> Result<PathBuf> {
+    pub fn extract_mount_point(path: &Path) -> Result<PathBuf> {
         let mut bytes = Vec::from(path.as_os_str().as_bytes());
         bytes.push(0);
 
