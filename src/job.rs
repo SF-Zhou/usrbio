@@ -1,25 +1,46 @@
 use super::*;
-use std::sync::Arc;
 
-#[derive(Debug)]
-pub struct ReadJob {
-    pub file: Arc<File>,
-    pub offset: u64,
-    pub length: usize,
+pub trait ReadJob {
+    fn file(&self) -> &File;
+    fn offset(&self) -> u64;
+    fn length(&self) -> usize;
 }
 
-pub type Callback = Box<dyn FnOnce(&[ReadJob], &[u8], &[hf3fs_cqe]) + Sync + Send>;
+impl ReadJob for (&File, u64, usize) {
+    fn file(&self) -> &File {
+        self.0
+    }
 
-pub struct BatchReadJob {
-    pub jobs: Vec<ReadJob>,
-    pub callback: Callback,
+    fn offset(&self) -> u64 {
+        self.1
+    }
+
+    fn length(&self) -> usize {
+        self.2
+    }
 }
 
-impl BatchReadJob {
-    pub fn set_error(self, cqes: &mut [hf3fs_cqe], errno: i32) {
-        for cqe in cqes.iter_mut() {
-            cqe.result = -errno as i64;
-        }
-        (self.callback)(&self.jobs, &[], cqes);
+pub struct ReadResult<'a> {
+    pub ret: i64,
+    pub buf: &'a [u8],
+}
+
+pub trait WriteJob {
+    fn file(&self) -> &File;
+    fn data(&self) -> &[u8];
+    fn offset(&self) -> u64;
+}
+
+impl WriteJob for (&File, &[u8], u64) {
+    fn file(&self) -> &File {
+        self.0
+    }
+
+    fn data(&self) -> &[u8] {
+        self.1
+    }
+
+    fn offset(&self) -> u64 {
+        self.2
     }
 }

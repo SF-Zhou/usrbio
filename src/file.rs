@@ -33,7 +33,7 @@ impl File {
     fn register_file(file: &fs::File) -> Result<()> {
         let ret = unsafe { super::hf3fs_reg_fd(file.as_raw_fd(), 0) };
         if ret > 0 {
-            Err(Error::RegisterFileFailed)
+            Err(Error::RegisterFileFailed(ret))
         } else {
             Ok(())
         }

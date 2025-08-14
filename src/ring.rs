@@ -1,11 +1,10 @@
-use crate::*;
-use std::{ffi::c_void, ops::Deref, os::fd::AsRawFd, path::Path, ptr::null_mut};
+use crate::{job::ReadResult, *};
+use std::{ops::Deref, os::fd::AsRawFd, path::Path};
 
 #[derive(Debug, Clone)]
 pub struct RingConfig {
     pub entries: usize,
     pub buf_size: usize,
-    pub for_read: bool,
     pub io_depth: i32,
     pub timeout: i32,
     pub numa: i32,
@@ -18,7 +17,6 @@ impl Default for RingConfig {
         Self {
             entries: 1024,
             buf_size: 4 << 20,
-            for_read: true,
             io_depth: 0,
             timeout: 0,
             numa: -1,
@@ -30,16 +28,27 @@ impl Default for RingConfig {
 
 pub struct Ring {
     config: RingConfig,
-    ior: Ior,
+    read_ior: Ior,
+    write_ior: Ior,
     iov: Iov,
+    cqes: Vec<hf3fs_cqe>,
 }
 
 impl Ring {
     pub fn create(config: &RingConfig, mount_point: &Path) -> Result<Self> {
-        let ior = Ior::create(
+        let read_ior = Ior::create(
             mount_point,
             config.entries as _,
-            config.for_read,
+            true,
+            config.io_depth,
+            config.timeout,
+            config.numa,
+            config.flags,
+        )?;
+        let write_ior = Ior::create(
+            mount_point,
+            config.entries as _,
+            false,
             config.io_depth,
             config.timeout,
             config.numa,
@@ -49,98 +58,80 @@ impl Ring {
 
         Ok(Self {
             config: config.clone(),
-            ior,
+            read_ior,
+            write_ior,
             iov,
+            cqes: vec![hf3fs_cqe::default(); config.entries],
         })
     }
 
-    pub fn batch_read(&mut self, job: BatchReadJob, cqes: &mut [hf3fs_cqe]) {
-        assert_eq!(job.jobs.len(), cqes.len());
-        assert!(cqes.len() <= self.config.entries);
+    pub fn read(&mut self, file: &File, offset: u64, length: usize) -> Result<&[u8]> {
+        let results = self.batch_read(&[(file, offset, length)])?;
+        match &results[0] {
+            e if e.ret < 0 => Err(Error::ReadFailed(e.ret as i32)),
+            r => Ok(r.buf),
+        }
+    }
 
-        let total_len = job.jobs.iter().map(|job| job.length).sum::<usize>();
-        assert!(total_len < self.config.buf_size);
+    pub fn batch_read(&mut self, jobs: &[impl ReadJob]) -> Result<Vec<ReadResult<'_>>> {
+        let count = jobs.len();
+        if count > self.config.entries {
+            return Err(Error::InsufficientEntriesLength);
+        }
 
-        let mut ptr = self.iov.base as *mut c_void;
-        let mut prepare_errno = None;
-        for (idx, read_job) in job.jobs.iter().enumerate() {
+        let total_len = jobs.iter().map(|job| job.length()).sum::<usize>();
+        if total_len > self.config.buf_size {
+            return Err(Error::InsufficientBufferLength);
+        }
+
+        let mut buf = unsafe { std::slice::from_raw_parts(self.iov.base, self.config.buf_size) };
+        let mut submitted = 0;
+        let mut results = Vec::with_capacity(count);
+        for (idx, job) in jobs.iter().enumerate() {
+            if job.length() == 0 {
+                results.push(ReadResult { ret: 0, buf: &[] });
+                continue;
+            }
+
             let ret = unsafe {
                 hf3fs_prep_io(
-                    self.ior.deref(),
+                    self.read_ior.deref(),
                     self.iov.deref(),
                     true,
-                    ptr,
-                    read_job.file.as_raw_fd(),
-                    read_job.offset as usize,
-                    read_job.length as u64,
+                    buf.as_ptr() as _,
+                    job.file().as_raw_fd(),
+                    job.offset() as usize,
+                    job.length() as u64,
                     idx as _,
                 )
             };
             if ret < 0 {
-                prepare_errno = Some(-ret);
-                break;
+                return Err(Error::PrepareIOFailed(-ret));
             }
-            ptr = unsafe { ptr.add(read_job.length) };
-        }
-        if let Some(errno) = prepare_errno.take() {
-            return self.set_error(job, cqes, errno);
-        }
-
-        let ret = unsafe { hf3fs_submit_ios(self.ior.deref()) };
-        if ret != 0 {
-            return self.set_error(job, cqes, -ret);
+            results.push(ReadResult {
+                ret: 0,
+                buf: &buf[..job.length()],
+            });
+            buf = &buf[job.length()..];
+            submitted += 1;
         }
 
-        let ret = unsafe {
-            hf3fs_wait_for_ios(
-                self.ior.deref(),
-                cqes.as_mut_ptr(),
-                cqes.len() as _,
-                cqes.len() as _,
-                std::ptr::null_mut(),
-            )
-        };
-        if ret < 0 {
-            return self.set_error(job, cqes, -ret);
-        }
-        let buf = unsafe { std::slice::from_raw_parts(self.iov.base, self.config.buf_size) };
-        cqes.sort_by_key(|cqe| cqe.userdata as usize);
-        (job.callback)(&job.jobs, buf, cqes);
-    }
-
-    pub fn write(&mut self, file: &File, buf: &[u8], offset: u64) -> Result<usize> {
-        assert!(buf.len() <= self.config.buf_size);
-        let slice = unsafe { std::slice::from_raw_parts_mut(self.iov.base, buf.len()) };
-        slice.copy_from_slice(buf);
-
-        let ret = unsafe {
-            hf3fs_prep_io(
-                self.ior.deref(),
-                self.iov.deref(),
-                false,
-                self.iov.base as _,
-                file.as_raw_fd(),
-                offset as usize,
-                buf.len() as u64,
-                null_mut(),
-            )
-        };
-        if ret < 0 {
-            return Err(Error::PrepareIOFailed(-ret));
+        if submitted == 0 {
+            return Ok(results);
         }
 
-        let ret = unsafe { hf3fs_submit_ios(self.ior.deref()) };
+        let ret = unsafe { hf3fs_submit_ios(self.read_ior.deref()) };
         if ret != 0 {
             return Err(Error::SubmitIOsFailed(-ret));
         }
 
-        let mut cqes = [hf3fs_cqe::default()];
         let ret = unsafe {
+            self.cqes.set_len(submitted);
             hf3fs_wait_for_ios(
-                self.ior.deref(),
-                cqes.as_mut_ptr(),
-                cqes.len() as _,
-                cqes.len() as _,
+                self.read_ior.deref(),
+                self.cqes.as_mut_ptr(),
+                submitted as _,
+                submitted as _,
                 std::ptr::null_mut(),
             )
         };
@@ -148,19 +139,91 @@ impl Ring {
             return Err(Error::WaitForIOsFailed(-ret));
         }
 
-        if cqes[0].result < 0 {
-            return Err(Error::WriteFailed(-cqes[0].result as _));
+        for cqe in &self.cqes {
+            let result = &mut results[cqe.userdata as usize];
+            result.ret = cqe.result;
+            result.buf = &result.buf[..cqe.result as usize];
         }
-
-        Ok(cqes[0].result as _)
+        Ok(results)
     }
 
-    #[inline(always)]
-    fn set_error(&self, job: BatchReadJob, cqes: &mut [hf3fs_cqe], errno: i32) {
-        for (_, cqe) in job.jobs.iter().zip(cqes.iter_mut()) {
-            cqe.result = errno as _;
+    pub fn write(&mut self, file: &File, buf: &[u8], offset: u64) -> Result<usize> {
+        let results = self.batch_write(&[(file, buf, offset)])?;
+        match results[0] {
+            e if e < 0 => Err(Error::WriteFailed(-e as i32)),
+            r => Ok(r as usize),
         }
-        let buf = unsafe { std::slice::from_raw_parts(self.iov.base, self.config.buf_size) };
-        (job.callback)(&job.jobs, buf, cqes);
+    }
+
+    pub fn batch_write(&mut self, jobs: &[impl WriteJob]) -> Result<Vec<i64>> {
+        let count = jobs.len();
+        if count > self.config.entries {
+            return Err(Error::InsufficientEntriesLength);
+        }
+
+        let total_len = jobs.iter().map(|job| job.data().len()).sum::<usize>();
+        if total_len > self.config.buf_size {
+            return Err(Error::InsufficientBufferLength);
+        }
+
+        let mut buf =
+            unsafe { std::slice::from_raw_parts_mut(self.iov.base, self.config.buf_size) };
+        let mut submitted = 0;
+        let mut results = vec![0; count];
+        for (idx, job) in jobs.iter().enumerate() {
+            if job.data().is_empty() {
+                continue;
+            }
+
+            let len = job.data().len();
+            buf[..len].copy_from_slice(job.data());
+
+            let ret = unsafe {
+                hf3fs_prep_io(
+                    self.write_ior.deref(),
+                    self.iov.deref(),
+                    false,
+                    buf.as_ptr() as _,
+                    job.file().as_raw_fd(),
+                    job.offset() as usize,
+                    len as u64,
+                    idx as _,
+                )
+            };
+            if ret < 0 {
+                return Err(Error::PrepareIOFailed(-ret));
+            }
+
+            buf = &mut buf[len..];
+            submitted += 1;
+        }
+
+        if submitted == 0 {
+            return Ok(results);
+        }
+
+        let ret = unsafe { hf3fs_submit_ios(self.write_ior.deref()) };
+        if ret != 0 {
+            return Err(Error::SubmitIOsFailed(-ret));
+        }
+
+        let ret = unsafe {
+            self.cqes.set_len(submitted);
+            hf3fs_wait_for_ios(
+                self.write_ior.deref(),
+                self.cqes.as_mut_ptr(),
+                submitted as _,
+                submitted as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            return Err(Error::WaitForIOsFailed(-ret));
+        }
+
+        for cqe in &self.cqes {
+            results[cqe.userdata as usize] = cqe.result;
+        }
+        Ok(results)
     }
 }
