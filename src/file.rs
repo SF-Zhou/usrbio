@@ -75,7 +75,10 @@ impl File {
         }
 
         let mountpoint = Self::extract_mount_point(path)?;
-        cache().write().unwrap().push(mountpoint.clone());
+        let mut cache = cache().write().unwrap();
+        if !cache.contains(&mountpoint) {
+            cache.push(mountpoint.clone());
+        }
 
         Ok(mountpoint)
     }
