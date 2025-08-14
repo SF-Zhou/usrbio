@@ -18,10 +18,10 @@ mod ring;
 pub use ring::{Ring, RingConfig};
 
 mod job;
-pub use job::{BatchReadJob, Callback, ReadJob};
+pub use job::{ReadJob, ReadResult, WriteJob};
 
 mod worker;
-pub use worker::ReadWorker;
+pub use worker::{BatchReadJobs, Callback, ReadWorker, SendableReadJob};
 
 mod workers;
 pub use workers::ReadWorkers;
