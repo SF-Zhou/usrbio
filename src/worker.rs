@@ -60,10 +60,10 @@ impl ReadWorker {
                 continue;
             }
 
-            if let Some(ring) = rings.get(mount_point) {
+            if let Some(ring) = rings.get_mut(mount_point) {
                 ring.batch_read(job, cqes);
             } else {
-                let ring = match Ring::create(&config, mount_point) {
+                let mut ring = match Ring::create(&config, mount_point) {
                     Ok(r) => r,
                     Err(e) => {
                         job.set_error(cqes, e.errno());

@@ -25,7 +25,7 @@ fn test() {
     File::open("/dev/zero").unwrap_err();
 
     let config = RingConfig::default();
-    let ring = Ring::create(&config, &mount_point).unwrap();
+    let mut ring = Ring::create(&config, &mount_point).unwrap();
     let file = Arc::new(file);
 
     {
@@ -82,7 +82,7 @@ fn test() {
         for_read: false,
         ..Default::default()
     };
-    let ring = Ring::create(&config, &mount_point).unwrap();
+    let mut ring = Ring::create(&config, &mount_point).unwrap();
     let buf = b"hello world!";
     let ret = ring.write(&file, buf, 0).unwrap();
     assert_eq!(ret, buf.len());

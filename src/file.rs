@@ -5,6 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 #[derive(Debug)]
 pub struct File {
@@ -38,8 +39,8 @@ impl File {
         }
     }
 
-    pub fn extract_mount_point(path: &Path) -> Result<PathBuf> {
-        let mut bytes = Vec::from(path.as_os_str().as_bytes());
+    pub fn extract_mount_point(path: impl AsRef<Path>) -> Result<PathBuf> {
+        let mut bytes = Vec::from(path.as_ref().as_os_str().as_bytes());
         bytes.push(0);
 
         let max_len = bytes.len();
@@ -56,6 +57,27 @@ impl File {
         }
         out.truncate(ret as usize - 1);
         Ok(PathBuf::from(OsString::from_vec(out)))
+    }
+
+    pub fn extract_mount_point_with_cache(path: impl AsRef<Path>) -> Result<PathBuf> {
+        fn cache() -> &'static RwLock<Vec<PathBuf>> {
+            static CACHE: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
+            CACHE.get_or_init(RwLock::default)
+        }
+
+        {
+            let mountpoints = cache().read().unwrap();
+            for mountpoint in mountpoints.iter() {
+                if path.as_ref().starts_with(mountpoint) {
+                    return Ok(PathBuf::from(mountpoint));
+                }
+            }
+        }
+
+        let mountpoint = Self::extract_mount_point(path)?;
+        cache().write().unwrap().push(mountpoint.clone());
+
+        Ok(mountpoint)
     }
 }
 
@@ -95,7 +117,7 @@ impl Open3fsFile for fs::OpenOptions {
             .as_ref()
             .canonicalize()
             .map_err(|_| Error::ExtractMountPointFailed)?;
-        let mount_point = File::extract_mount_point(&realpath)?;
+        let mount_point = File::extract_mount_point_with_cache(&realpath)?;
         unsafe { File::new(f, mount_point) }
     }
 }
