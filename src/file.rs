@@ -74,10 +74,7 @@ impl File {
             }
         }
 
-        let mut mountpoint = Self::extract_mount_point(path)?;
-        if !mountpoint.ends_with(std::path::MAIN_SEPARATOR.to_string()) {
-            mountpoint.push(std::path::MAIN_SEPARATOR.to_string());
-        }
+        let mountpoint = Self::extract_mount_point(path)?;
         cache().write().unwrap().push(mountpoint.clone());
 
         Ok(mountpoint)
