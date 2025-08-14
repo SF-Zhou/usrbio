@@ -54,7 +54,7 @@ impl Ring {
         })
     }
 
-    pub fn batch_read(&self, job: BatchReadJob, cqes: &mut [hf3fs_cqe]) {
+    pub fn batch_read(&mut self, job: BatchReadJob, cqes: &mut [hf3fs_cqe]) {
         assert_eq!(job.jobs.len(), cqes.len());
         assert!(cqes.len() <= self.config.entries);
 
@@ -108,7 +108,7 @@ impl Ring {
         (job.callback)(&job.jobs, buf, cqes);
     }
 
-    pub fn write(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize> {
+    pub fn write(&mut self, file: &File, buf: &[u8], offset: u64) -> Result<usize> {
         assert!(buf.len() <= self.config.buf_size);
         let slice = unsafe { std::slice::from_raw_parts_mut(self.iov.base, buf.len()) };
         slice.copy_from_slice(buf);
