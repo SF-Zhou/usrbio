@@ -13,6 +13,7 @@ pub enum Error {
     InvalidArgument,
     InsufficientEntriesLength,
     InsufficientBufferLength,
+    IOError(std::io::Error),
 }
 
 impl Error {
@@ -32,6 +33,12 @@ impl Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::IOError(error)
+    }
+}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

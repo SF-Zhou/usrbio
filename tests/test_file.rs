@@ -117,7 +117,7 @@ fn test_batch_write() {
     for i in 0..N {
         read_jobs.push((&files[i], 0, i));
     }
-    let results = ring.batch_read(&read_jobs[..N/10]).unwrap();
+    let results = ring.batch_read(&read_jobs[..N / 10]).unwrap();
     for (idx, result) in results.iter().enumerate() {
         assert_eq!(result.ret, idx as i64);
         assert_eq!(result.buf, bufs[idx]);
