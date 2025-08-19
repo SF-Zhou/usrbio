@@ -64,6 +64,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub print_throughput: bool,
 
+    /// Write stress test.
+    #[arg(long, default_value_t = false)]
+    pub write: bool,
+
     /// Path.
     #[arg()]
     paths: Vec<PathBuf>,
@@ -346,7 +350,10 @@ async fn bench(state: Arc<State>) -> Result<()> {
 
     let mut files = Vec::with_capacity(paths.len());
     for path in &paths {
-        let file = File::open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open_3fs_file(path)?;
         let length = file.metadata()?.len();
         files.push((Arc::new(file), length));
     }
@@ -364,21 +371,36 @@ async fn bench(state: Arc<State>) -> Result<()> {
             let bs = state.args.bs.0;
             let iodepth = state.args.iodepth;
             let mount_point = files[0].0.mount_point().to_owned();
+            let is_write = state.args.write;
             while start_time.elapsed() <= state.args.duration.0 {
-                let mut jobs = Vec::with_capacity(iodepth);
+                let mut read_jobs = Vec::with_capacity(iodepth);
+                let mut write_jobs = Vec::with_capacity(iodepth);
                 for _ in 0..iodepth {
                     let (file, length) = files.choose(&mut rand::rng()).unwrap();
                     let offset = rand::random::<u64>() % (length.next_multiple_of(bs) / bs) * bs;
-                    jobs.push((file.clone(), offset, bs as usize));
+                    if is_write {
+                        write_jobs.push((file.clone(), &state.data[..bs as usize], offset));
+                    } else {
+                        read_jobs.push((file.clone(), offset, bs as usize));
+                    }
                 }
 
                 let result = tls_ring_with(
                     move |ring| {
-                        let results = ring.batch_read(&jobs)?;
                         let mut b = 0;
-                        for result in results {
-                            if result.ret >= 0 {
-                                b += result.ret;
+                        if is_write {
+                            let results = ring.batch_write(&write_jobs)?;
+                            for result in results {
+                                if result >= 0 {
+                                    b += result;
+                                }
+                            }
+                        } else {
+                            let results = ring.batch_read(&read_jobs)?;
+                            for result in results {
+                                if result.ret >= 0 {
+                                    b += result.ret;
+                                }
                             }
                         }
                         Ok(b)
@@ -390,6 +412,7 @@ async fn bench(state: Arc<State>) -> Result<()> {
                     Ok(b) => {
                         bytes.fetch_add(b as u64, Ordering::AcqRel);
                     }
+                    Err(e) if is_write => eprintln!("write filed: {e}"),
                     Err(e) => eprintln!("read filed: {e}"),
                 }
             }
