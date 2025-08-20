@@ -32,6 +32,10 @@ pub struct Args {
     #[arg(long, default_value_t = 32)]
     pub threads: usize,
 
+    /// Concurrency limit for a single file. Use `threads` in default.
+    #[arg(long, default_value_t = 0)]
+    pub concurrency_limit: usize,
+
     /// Block size.
     #[arg(long, value_parser=clap::value_parser!(Size), default_value = "512k")]
     pub bs: Size,
@@ -170,7 +174,7 @@ async fn parallel_read(path: &Path, state: &Arc<State>, bytes: &Arc<AtomicU64>) 
     let mut full_crc = 0;
     while begin < length {
         let count = std::cmp::min(
-            state.args.threads,
+            state.args.concurrency_limit,
             ((length - begin).next_multiple_of(buf_size) / buf_size) as usize,
         );
 
@@ -265,7 +269,7 @@ async fn parallel_write(path: &Path, state: &Arc<State>, bytes: &Arc<AtomicU64>)
     let mut full_crc = 0;
     while begin < length {
         let count = std::cmp::min(
-            state.args.threads,
+            state.args.concurrency_limit,
             ((length - begin).next_multiple_of(buf_size) / buf_size) as usize,
         );
 
@@ -519,7 +523,10 @@ async fn gen_files(state: Arc<State>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.concurrency_limit == 0 {
+        args.concurrency_limit = args.threads;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.threads)
         .max_blocking_threads(args.threads)
