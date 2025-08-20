@@ -1,14 +1,23 @@
 use crate::{job::ReadResult, *};
 use std::{ops::Deref, os::fd::AsRawFd, path::Path};
 
+/// Configuration parameters for the I/O ring.
+/// This structure defines the settings used to create and configure an I/O ring.
 #[derive(Debug, Clone)]
 pub struct RingConfig {
+    /// Number of entries in the ring buffer
     pub entries: usize,
+    /// Size of the I/O buffer in bytes
     pub buf_size: usize,
+    /// Maximum I/O depth for concurrent operations
     pub io_depth: i32,
+    /// Timeout value for I/O operations
     pub timeout: i32,
+    /// NUMA node identifier (-1 for no NUMA awareness)
     pub numa: i32,
+    /// Additional flags for ring configuration
     pub flags: u64,
+    /// Block size for I/O operations
     pub block_size: usize,
 }
 
@@ -26,6 +35,8 @@ impl Default for RingConfig {
     }
 }
 
+/// An I/O ring that manages asynchronous read and write operations.
+/// Provides facilities for both single and batch I/O operations with configurable parameters.
 pub struct Ring {
     config: RingConfig,
     read_ior: Ior,
@@ -35,6 +46,14 @@ pub struct Ring {
 }
 
 impl Ring {
+    /// Creates a new I/O ring with the specified configuration and mount point.
+    ///
+    /// # Arguments
+    /// * `config` - Ring configuration parameters
+    /// * `mount_point` - Mount point path for the filesystem
+    ///
+    /// # Returns
+    /// * `Result<Self>` - A new Ring instance or an error
     pub fn create(config: &RingConfig, mount_point: &Path) -> Result<Self> {
         let read_ior = Ior::create(
             mount_point,
@@ -65,6 +84,15 @@ impl Ring {
         })
     }
 
+    /// Performs a single read operation.
+    ///
+    /// # Arguments
+    /// * `file` - The file to read from
+    /// * `offset` - Starting position for the read
+    /// * `length` - Number of bytes to read
+    ///
+    /// # Returns
+    /// * `Result<&[u8]>` - The read data as a byte slice or an error
     pub fn read(&mut self, file: &File, offset: u64, length: usize) -> Result<&[u8]> {
         let results = self.batch_read(&[(file, offset, length)])?;
         match &results[0] {
@@ -73,6 +101,17 @@ impl Ring {
         }
     }
 
+    /// Performs multiple read operations in a batch.
+    ///
+    /// # Arguments
+    /// * `jobs` - Slice of read operations to perform
+    ///
+    /// # Returns
+    /// * `Result<Vec<ReadResult<'_>>>` - Vector of read results or an error
+    ///
+    /// # Errors
+    /// * Returns error if number of jobs exceeds ring entries
+    /// * Returns error if total read length exceeds buffer size
     pub fn batch_read(&mut self, jobs: &[impl ReadJob]) -> Result<Vec<ReadResult<'_>>> {
         let count = jobs.len();
         if count > self.config.entries {
@@ -147,6 +186,15 @@ impl Ring {
         Ok(results)
     }
 
+    /// Performs a single write operation.
+    ///
+    /// # Arguments
+    /// * `file` - The file to write to
+    /// * `buf` - Data to write
+    /// * `offset` - Starting position for the write
+    ///
+    /// # Returns
+    /// * `Result<usize>` - Number of bytes written or an error
     pub fn write(&mut self, file: &File, buf: &[u8], offset: u64) -> Result<usize> {
         let results = self.batch_write(&[(file, buf, offset)])?;
         match results[0] {
@@ -155,6 +203,17 @@ impl Ring {
         }
     }
 
+    /// Performs multiple write operations in a batch.
+    ///
+    /// # Arguments
+    /// * `jobs` - Slice of write operations to perform
+    ///
+    /// # Returns
+    /// * `Result<Vec<i64>>` - Vector of write results (bytes written) or an error
+    ///
+    /// # Errors
+    /// * Returns error if number of jobs exceeds ring entries
+    /// * Returns error if total write length exceeds buffer size
     pub fn batch_write(&mut self, jobs: &[impl WriteJob]) -> Result<Vec<i64>> {
         let count = jobs.len();
         if count > self.config.entries {
