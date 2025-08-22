@@ -181,7 +181,7 @@ impl Ring {
         for cqe in &self.cqes {
             let result = &mut results[cqe.userdata as usize];
             result.ret = cqe.result;
-            result.buf = &result.buf[..cqe.result as usize];
+            result.buf = &result.buf[..std::cmp::max(0, cqe.result) as usize];
         }
         Ok(results)
     }
