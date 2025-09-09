@@ -19,6 +19,8 @@ pub enum Action {
     Bench,
     Check,
     GenFiles,
+    ReadFile,
+    WriteFile,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -71,6 +73,22 @@ pub struct Args {
     /// Write stress test.
     #[arg(long, default_value_t = false)]
     pub write: bool,
+
+    /// Input file path for WriteFile action.
+    #[arg(long)]
+    pub input_path: Option<PathBuf>,
+
+    /// Output file path for ReadFile action.
+    #[arg(long)]
+    pub output_path: Option<PathBuf>,
+
+    /// Offset for ReadFile/WriteFile operations.
+    #[arg(long, default_value_t = 0)]
+    pub offset: u64,
+
+    /// Length for ReadFile/WriteFile operations. Use file length if not specified.
+    #[arg(long)]
+    pub file_length: Option<u64>,
 
     /// Path.
     #[arg()]
@@ -345,6 +363,104 @@ fn print_throughput(bytes: &Arc<AtomicU64>) {
     });
 }
 
+async fn read_file_action(state: Arc<State>) -> Result<()> {
+    let input_path = state.args.paths.first().ok_or(Error::InvalidArgument)?;
+    
+    // Open file for reading
+    let file = File::open(input_path)?;
+    let file_size = file.metadata()?.len();
+    
+    let offset = state.args.offset;
+    let length = state.args.file_length.unwrap_or(file_size - offset);
+    
+    // Validate parameters
+    if offset >= file_size {
+        eprintln!("Offset {} is beyond file size {}", offset, file_size);
+        return Err(Error::InvalidArgument);
+    }
+    let actual_length = std::cmp::min(length, file_size - offset);
+    
+    // Read data using the ring
+    let data = tls_ring_with(
+        |ring| -> Result<Vec<u8>> {
+            let result = ring.read(&file, offset, actual_length as usize)?;
+            Ok(result.to_vec())
+        },
+        file.mount_point(),
+        &state.args,
+    )?;
+    
+    // Output data
+    match &state.args.output_path {
+        Some(output_path) => {
+            // Write to file
+            std::fs::write(output_path, &data)?;
+            println!("Read {} bytes from {} (offset={}) and wrote to {}", 
+                    data.len(), input_path.display(), offset, output_path.display());
+        },
+        None => {
+            // Write to stdout
+            use std::io::Write;
+            std::io::stdout().write_all(&data)?;
+        }
+    }
+    
+    Ok(())
+}
+
+async fn write_file_action(state: Arc<State>) -> Result<()> {
+    let output_path = state.args.paths.first().ok_or(Error::InvalidArgument)?;
+    
+    // Read input data
+    let data = match &state.args.input_path {
+        Some(input_path) => {
+            // Read from file
+            std::fs::read(input_path)?
+        },
+        None => {
+            // Read from stdin
+            use std::io::Read;
+            let mut buffer = Vec::new();
+            std::io::stdin().read_to_end(&mut buffer)?;
+            buffer
+        }
+    };
+    
+    let offset = state.args.offset;
+    let length = state.args.file_length.unwrap_or(data.len() as u64);
+    let actual_length = std::cmp::min(length as usize, data.len());
+    let write_data = &data[..actual_length];
+    
+    // Open or create file for writing
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open_3fs_file(output_path)?;
+    
+    // Write data using the ring
+    let bytes_written = tls_ring_with(
+        |ring| -> Result<usize> {
+            ring.write(&file, write_data, offset)
+        },
+        file.mount_point(),
+        &state.args,
+    )?;
+    
+    match &state.args.input_path {
+        Some(input_path) => {
+            println!("Wrote {} bytes from {} to {} (offset={})", 
+                    bytes_written, input_path.display(), output_path.display(), offset);
+        },
+        None => {
+            println!("Wrote {} bytes from stdin to {} (offset={})", 
+                    bytes_written, output_path.display(), offset);
+        }
+    }
+    
+    Ok(())
+}
+
 async fn bench(state: Arc<State>) -> Result<()> {
     let paths = collect_file_paths(&state.args.paths)?;
     if paths.is_empty() {
@@ -543,5 +659,7 @@ fn main() -> Result<()> {
         Action::Bench => state.runtime.block_on(bench(state.clone())),
         Action::Check => state.runtime.block_on(check(state.clone())),
         Action::GenFiles => state.runtime.block_on(gen_files(state.clone())),
+        Action::ReadFile => state.runtime.block_on(read_file_action(state.clone())),
+        Action::WriteFile => state.runtime.block_on(write_file_action(state.clone())),
     }
 }
