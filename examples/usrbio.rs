@@ -72,6 +72,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub write: bool,
 
+    /// Numa. -1 for no NUMA awareness.
+    #[arg(long, default_value_t = -1)]
+    pub numa: i32,
+
     /// Path.
     #[arg()]
     paths: Vec<PathBuf>,
@@ -86,6 +90,7 @@ impl Args {
         RingConfig {
             entries: self.iodepth,
             buf_size: self.buf_size(),
+            numa: self.numa,
             ..Default::default()
         }
     }
@@ -352,11 +357,12 @@ async fn bench(state: Arc<State>) -> Result<()> {
         return Err(Error::InvalidArgument);
     }
 
+    let is_write = state.args.write;
     let mut files = Vec::with_capacity(paths.len());
     for path in &paths {
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(is_write)
             .open_3fs_file(path)?;
         let length = file.metadata()?.len();
         files.push((Arc::new(file), length));
@@ -375,7 +381,6 @@ async fn bench(state: Arc<State>) -> Result<()> {
             let bs = state.args.bs.0;
             let iodepth = state.args.iodepth;
             let mount_point = files[0].0.mount_point().to_owned();
-            let is_write = state.args.write;
             while start_time.elapsed() <= state.args.duration.0 {
                 let mut read_jobs = Vec::with_capacity(iodepth);
                 let mut write_jobs = Vec::with_capacity(iodepth);
