@@ -1,6 +1,8 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
+    io::Read,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -19,6 +21,7 @@ pub enum Action {
     Bench,
     Check,
     GenFiles,
+    WriteFile,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -76,6 +79,14 @@ pub struct Args {
     #[arg(long, default_value_t = -1)]
     pub numa: i32,
 
+    /// Offset for write.
+    #[arg(long, default_value_t = 0)]
+    pub offset: u64,
+
+    /// Input file path for write.
+    #[arg(short, long, default_value = None)]
+    pub input_path: Option<PathBuf>,
+
     /// Path.
     #[arg()]
     paths: Vec<PathBuf>,
@@ -102,8 +113,11 @@ struct State {
     data: Vec<u8>,
 }
 
+const BLOCK_SIZE: usize = 16 << 20;
+
 thread_local! {
     static TLS: RefCell<HashMap<PathBuf, Ring>> = RefCell::new(Default::default());
+    static TLS_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; BLOCK_SIZE]);
 }
 
 fn tls_ring_with<F, R>(f: F, mount_point: &Path, args: &Args) -> Result<R>
@@ -527,6 +541,75 @@ async fn gen_files(state: Arc<State>) -> Result<()> {
     first_error.map(Err).unwrap_or(Ok(()))
 }
 
+async fn do_write(state: Arc<State>) -> Result<()> {
+    assert!(state.args.paths.len() == 1);
+
+    let file = if let Some(path) = state.args.paths.first() {
+        Arc::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open_3fs_file(path)?,
+        )
+    } else {
+        panic!("please input a output file path");
+    };
+    let bytes = Arc::new(AtomicU64::default());
+
+    if let Some(input_path) = &state.args.input_path {
+        let input_file = Arc::new(File::open(input_path)?);
+        let input_length = input_file.metadata()?.len();
+        let mut input_offset = 0;
+        let mut output_offset = state.args.offset;
+        while input_offset < input_length {
+            let mut tasks = vec![];
+            for _ in 0..state.args.threads {
+                let length = std::cmp::min(input_length - input_offset, BLOCK_SIZE as u64);
+                let state = state.clone();
+                let input_file = input_file.clone();
+                let output_file = file.clone();
+                let bytes = bytes.clone();
+
+                tasks.push(tokio::task::spawn_blocking(move || {
+                    TLS_BUF.with_borrow_mut(|tls| -> Result<u64> {
+                        let buf = tls.as_mut_slice();
+                        let buf = &mut buf[..length as usize];
+                        input_file.read_exact_at(buf, input_offset)?;
+                        Ok(write_file(&output_file, buf, output_offset, &state, &bytes)?.0)
+                    })
+                }));
+
+                input_offset += length;
+                output_offset += length;
+                if input_offset == input_length {
+                    break;
+                }
+            }
+
+            for task in tasks {
+                task.await.unwrap().unwrap();
+            }
+        }
+    } else {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut offset = state.args.offset;
+        loop {
+            let n = handle.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let (length, _) = write_file(&file, &buf[..n], offset, &state, &bytes)?;
+            assert_eq!(n as u64, length);
+            offset += length;
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = Args::parse();
     if args.concurrency_limit == 0 {
@@ -548,5 +631,6 @@ fn main() -> Result<()> {
         Action::Bench => state.runtime.block_on(bench(state.clone())),
         Action::Check => state.runtime.block_on(check(state.clone())),
         Action::GenFiles => state.runtime.block_on(gen_files(state.clone())),
+        Action::WriteFile => state.runtime.block_on(do_write(state.clone())),
     }
 }
