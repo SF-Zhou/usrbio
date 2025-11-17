@@ -1,6 +1,6 @@
 [package]
 name = "usrbio"
-version = "0.1.19"
+version = "0.1.20"
 edition = "2021"
 authors = ["SF-Zhou <sfzhou.scut@gmail.com>"]
 homepage = "https://github.com/SF-Zhou/usrbio"
