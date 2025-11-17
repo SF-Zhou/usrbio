@@ -558,7 +558,7 @@ async fn do_write(state: Arc<State>) -> Result<()> {
     let bytes = Arc::new(AtomicU64::default());
 
     if let Some(input_path) = &state.args.input_path {
-        let input_file = Arc::new(File::open(input_path)?);
+        let input_file = Arc::new(std::fs::File::open(input_path)?);
         let input_length = input_file.metadata()?.len();
         let mut input_offset = 0;
         let mut output_offset = state.args.offset;
