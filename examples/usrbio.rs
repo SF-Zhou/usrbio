@@ -111,13 +111,12 @@ struct State {
     args: Args,
     runtime: Runtime,
     data: Vec<u8>,
+    bufs: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
 }
-
-const BLOCK_SIZE: usize = 16 << 20;
 
 thread_local! {
     static TLS: RefCell<HashMap<PathBuf, Ring>> = RefCell::new(Default::default());
-    static TLS_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; BLOCK_SIZE]);
+    static TLS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::default());
 }
 
 fn tls_ring_with<F, R>(f: F, mount_point: &Path, args: &Args) -> Result<R>
@@ -565,7 +564,8 @@ async fn do_write(state: Arc<State>) -> Result<()> {
         while input_offset < input_length {
             let mut tasks = vec![];
             for _ in 0..state.args.threads {
-                let length = std::cmp::min(input_length - input_offset, BLOCK_SIZE as u64);
+                let buf_size = state.args.buf_size();
+                let length = std::cmp::min(input_length - input_offset, buf_size as u64);
                 let state = state.clone();
                 let input_file = input_file.clone();
                 let output_file = file.clone();
@@ -573,6 +573,9 @@ async fn do_write(state: Arc<State>) -> Result<()> {
 
                 tasks.push(tokio::task::spawn_blocking(move || {
                     TLS_BUF.with_borrow_mut(|tls| -> Result<u64> {
+                        if tls.len() != buf_size {
+                            tls.resize(buf_size, 0);
+                        }
                         let buf = tls.as_mut_slice();
                         let buf = &mut buf[..length as usize];
                         input_file.read_exact_at(buf, input_offset)?;
@@ -591,22 +594,83 @@ async fn do_write(state: Arc<State>) -> Result<()> {
                 task.await.unwrap().unwrap();
             }
         }
-    } else {
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        let mut offset = state.args.offset;
-        loop {
-            let n = handle.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            let (length, _) = write_file(&file, &buf[..n], offset, &state, &bytes)?;
-            assert_eq!(n as u64, length);
-            offset += length;
-        }
     }
 
+    Ok(())
+}
+
+fn do_write_from_stdin(state: Arc<State>) -> Result<()> {
+    assert!(state.args.paths.len() == 1);
+
+    let file = if let Some(path) = state.args.paths.first() {
+        Arc::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open_3fs_file(path)?,
+        )
+    } else {
+        panic!("please input a output file path");
+    };
+    let finished_bytes = Arc::new(AtomicU64::default());
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, u64)>(state.args.threads);
+    state.runtime.spawn_blocking({
+        let state = state.clone();
+        let file = file.clone();
+        let finished_bytes = finished_bytes.clone();
+        move || {
+            while let Ok(task) = rx.recv() {
+                let state = state.clone();
+                let file = file.clone();
+                let finished_bytes = finished_bytes.clone();
+                let (mut buf, offset) = task;
+                tokio::task::spawn_blocking(move || {
+                    let _ = tls_ring_with(
+                        |ring| -> Result<usize> { ring.write(&file, &buf, offset) },
+                        file.mount_point(),
+                        &state.args,
+                    )
+                    .unwrap();
+                    finished_bytes.fetch_add(buf.len() as u64, Ordering::AcqRel);
+                    unsafe {
+                        buf.set_len(buf.capacity());
+                    };
+                    state.bufs.lock().unwrap().push(buf);
+                });
+            }
+        }
+    });
+
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut offset = state.args.offset;
+    let buf_size = state.args.buf_size();
+    let mut finished = false;
+    while !finished {
+        let mut buf = if let Some(buf) = state.bufs.lock().unwrap().pop() {
+            buf
+        } else {
+            vec![0u8; buf_size]
+        };
+
+        let mut total = 0;
+        while total < buf_size {
+            let n = handle.read(&mut buf[total..])?;
+            if n == 0 {
+                finished = true;
+                break;
+            }
+            total += n;
+        }
+        buf.resize(total, 0);
+        tx.send((buf, offset)).unwrap();
+        offset += total as u64;
+    }
+    while finished_bytes.load(Ordering::Acquire) < offset {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     Ok(())
 }
 
@@ -624,6 +688,7 @@ fn main() -> Result<()> {
         data: vec![args.value; args.buf_size()],
         args,
         runtime,
+        bufs: Default::default(),
     };
     let state = Arc::new(state);
 
@@ -631,6 +696,12 @@ fn main() -> Result<()> {
         Action::Bench => state.runtime.block_on(bench(state.clone())),
         Action::Check => state.runtime.block_on(check(state.clone())),
         Action::GenFiles => state.runtime.block_on(gen_files(state.clone())),
-        Action::WriteFile => state.runtime.block_on(do_write(state.clone())),
+        Action::WriteFile => {
+            if state.args.input_path.is_some() {
+                state.runtime.block_on(do_write(state.clone()))
+            } else {
+                do_write_from_stdin(state)
+            }
+        }
     }
 }
