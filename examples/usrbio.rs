@@ -11,6 +11,7 @@ use std::{
 };
 
 use clap::{command, Parser, ValueEnum};
+use hdrhistogram::Histogram;
 use human_units::{Duration, Size};
 use rand::seq::IndexedRandom;
 use tokio::{runtime::Runtime, sync::Mutex, task::JoinHandle};
@@ -112,6 +113,8 @@ struct State {
     runtime: Runtime,
     data: Vec<u8>,
     bufs: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    bytes: Arc<AtomicU64>,
+    latencies: Arc<std::sync::Mutex<Histogram<u64>>>,
 }
 
 thread_local! {
@@ -136,15 +139,10 @@ where
     })
 }
 
-fn read_file(
-    file: &File,
-    offset: u64,
-    length: u64,
-    state: &State,
-    bytes: &Arc<AtomicU64>,
-) -> Result<(u64, u32)> {
+fn read_file(file: &File, offset: u64, length: u64, state: &State) -> Result<(u64, u32)> {
     let bs = state.args.bs.0;
-    tls_ring_with(
+    let start = std::time::Instant::now();
+    let res = tls_ring_with(
         |ring| -> Result<(u64, u32)> {
             let count = length.next_multiple_of(bs) / bs;
 
@@ -173,15 +171,22 @@ fn read_file(
                     return Err(Error::ReadFailed(22));
                 }
             }
-            bytes.fetch_add(sum, Ordering::AcqRel);
+            state.bytes.fetch_add(sum, Ordering::AcqRel);
             Ok((sum, crc))
         },
         file.mount_point(),
         &state.args,
-    )
+    );
+    state
+        .latencies
+        .lock()
+        .unwrap()
+        .record(start.elapsed().as_micros() as u64)
+        .ok();
+    res
 }
 
-async fn parallel_read(path: &Path, state: &Arc<State>, bytes: &Arc<AtomicU64>) -> Result<u32> {
+async fn parallel_read(path: &Path, state: &Arc<State>) -> Result<u32> {
     // 1. open file.
     let file = Arc::new(File::open(&path)?);
     let length = file.metadata()?.len();
@@ -203,8 +208,7 @@ async fn parallel_read(path: &Path, state: &Arc<State>, bytes: &Arc<AtomicU64>) 
             tasks.push(state.runtime.spawn_blocking({
                 let file = file.clone();
                 let state = state.clone();
-                let bytes = bytes.clone();
-                move || read_file(&file, offset, expected, &state, &bytes)
+                move || read_file(&file, offset, expected, &state)
             }));
         }
 
@@ -220,16 +224,11 @@ async fn parallel_read(path: &Path, state: &Arc<State>, bytes: &Arc<AtomicU64>) 
     Ok(full_crc)
 }
 
-fn write_file(
-    file: &File,
-    data: &[u8],
-    offset: u64,
-    state: &State,
-    bytes: &Arc<AtomicU64>,
-) -> Result<(u64, u32)> {
+fn write_file(file: &File, data: &[u8], offset: u64, state: &State) -> Result<(u64, u32)> {
     let length = data.len() as u64;
     let bs = state.args.bs.0;
-    tls_ring_with(
+    let start = std::time::Instant::now();
+    let res = tls_ring_with(
         |ring| -> Result<(u64, u32)> {
             let count = length.next_multiple_of(bs) / bs;
 
@@ -261,15 +260,22 @@ fn write_file(
                     return Err(Error::ReadFailed(22));
                 }
             }
-            bytes.fetch_add(sum, Ordering::AcqRel);
+            state.bytes.fetch_add(sum, Ordering::AcqRel);
             Ok((sum, crc))
         },
         file.mount_point(),
         &state.args,
-    )
+    );
+    state
+        .latencies
+        .lock()
+        .unwrap()
+        .record(start.elapsed().as_micros() as u64)
+        .ok();
+    res
 }
 
-async fn parallel_write(path: &Path, state: &Arc<State>, bytes: &Arc<AtomicU64>) -> Result<u32> {
+async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<u32> {
     // 1. open file.
     let file = Arc::new(
         std::fs::OpenOptions::new()
@@ -298,16 +304,7 @@ async fn parallel_write(path: &Path, state: &Arc<State>, bytes: &Arc<AtomicU64>)
             tasks.push(state.runtime.spawn_blocking({
                 let file = file.clone();
                 let state = state.clone();
-                let bytes = bytes.clone();
-                move || {
-                    write_file(
-                        &file,
-                        &state.data[..expected as usize],
-                        offset,
-                        &state,
-                        &bytes,
-                    )
-                }
+                move || write_file(&file, &state.data[..expected as usize], offset, &state)
             }));
         }
 
@@ -343,22 +340,50 @@ fn collect_file_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn print_throughput(bytes: &Arc<AtomicU64>) {
-    let bytes = bytes.clone();
+fn print_stats(state: Arc<State>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
-            let bytes = bytes.swap(0, Ordering::AcqRel);
-            if bytes >= 512 << 20 {
-                println!("Throughput: {:.1}GiB/s", bytes as f64 / f64::from(1 << 30));
-            } else if bytes >= 512 << 10 {
-                println!("Throughput: {:.1}MiB/s", bytes as f64 / f64::from(1 << 20));
-            } else if bytes >= 512 {
-                println!("Throughput: {:.1}KiB/s", bytes as f64 / f64::from(1 << 10));
+            let b = state.bytes.swap(0, Ordering::AcqRel);
+            let mut h = state.latencies.lock().unwrap();
+            let (avg, p50, p90, p99, max) = if h.len() > 0 {
+                let s = (
+                    h.mean(),
+                    h.value_at_quantile(0.5),
+                    h.value_at_quantile(0.9),
+                    h.value_at_quantile(0.99),
+                    h.max(),
+                );
+                h.reset();
+                s
             } else {
-                println!("Throughput: {}B/s", bytes);
+                (0.0, 0, 0, 0, 0)
+            };
+            drop(h);
+
+            if b == 0 && avg == 0.0 {
+                continue;
             }
+
+            let (val, unit) = if b >= 1 << 30 {
+                (b as f64 / (1 << 30) as f64, "GiB")
+            } else if b >= 1 << 20 {
+                (b as f64 / (1 << 20) as f64, "MiB")
+            } else if b >= 1 << 10 {
+                (b as f64 / (1 << 10) as f64, "KiB")
+            } else {
+                (b as f64, "B")
+            };
+
+            print!("Throughput: {:7.1} {}/s", val, unit);
+            if avg > 0.0 {
+                print!(
+                    ", Latency (us): avg {:8.1}, p50 {:6}, p90 {:6}, p99 {:6}, max {:6}",
+                    avg, p50, p90, p99, max
+                );
+            }
+            println!();
         }
     });
 }
@@ -381,15 +406,13 @@ async fn bench(state: Arc<State>) -> Result<()> {
         files.push((Arc::new(file), length));
     }
 
-    let bytes = Arc::new(AtomicU64::default());
-    print_throughput(&bytes);
+    print_stats(state.clone());
 
     let mut tasks = Vec::with_capacity(state.args.threads);
     let start_time = std::time::Instant::now();
     for _ in 0..state.args.threads {
         let state = state.clone();
         let files = files.clone();
-        let bytes = bytes.clone();
         tasks.push(tokio::task::spawn_blocking(move || {
             let bs = state.args.bs.0;
             let iodepth = state.args.iodepth;
@@ -407,6 +430,7 @@ async fn bench(state: Arc<State>) -> Result<()> {
                     }
                 }
 
+                let start = std::time::Instant::now();
                 let result = tls_ring_with(
                     move |ring| {
                         let mut b = 0;
@@ -430,12 +454,18 @@ async fn bench(state: Arc<State>) -> Result<()> {
                     &mount_point,
                     &state.args,
                 );
+                state
+                    .latencies
+                    .lock()
+                    .unwrap()
+                    .record(start.elapsed().as_micros() as u64)
+                    .ok();
                 match result {
                     Ok(b) => {
-                        bytes.fetch_add(b as u64, Ordering::AcqRel);
+                        state.bytes.fetch_add(b as u64, Ordering::AcqRel);
                     }
-                    Err(e) if is_write => eprintln!("write filed: {e}"),
-                    Err(e) => eprintln!("read filed: {e}"),
+                    Err(e) if is_write => eprintln!("write failed: {e}"),
+                    Err(e) => eprintln!("read failed: {e}"),
                 }
             }
         }));
@@ -451,9 +481,8 @@ async fn bench(state: Arc<State>) -> Result<()> {
 async fn check(state: Arc<State>) -> Result<()> {
     let paths = collect_file_paths(&state.args.paths)?;
 
-    let bytes = Arc::new(AtomicU64::default());
     if state.args.print_throughput {
-        print_throughput(&bytes);
+        print_stats(state.clone());
     }
 
     let first_error = Arc::new(Mutex::new(None));
@@ -468,11 +497,10 @@ async fn check(state: Arc<State>) -> Result<()> {
 
         let path = path.clone();
         let state = state.clone();
-        let bytes = bytes.clone();
         let first_error = first_error.clone();
         tasks.push_back(tokio::spawn({
             async move {
-                let result = parallel_read(&path, &state, &bytes).await;
+                let result = parallel_read(&path, &state).await;
                 match result {
                     Ok(crc) => {
                         println!("{:08X} {}", crc, path.display());
@@ -497,9 +525,8 @@ async fn check(state: Arc<State>) -> Result<()> {
 async fn gen_files(state: Arc<State>) -> Result<()> {
     let root = state.args.paths.first().unwrap();
 
-    let bytes = Arc::new(AtomicU64::default());
     if state.args.print_throughput {
-        print_throughput(&bytes);
+        print_stats(state.clone());
     }
 
     let first_error = Arc::new(Mutex::new(None));
@@ -514,11 +541,10 @@ async fn gen_files(state: Arc<State>) -> Result<()> {
 
         let path = root.join(format!("{}{idx}", state.args.prefix));
         let state = state.clone();
-        let bytes = bytes.clone();
         let first_error = first_error.clone();
         tasks.push_back(tokio::spawn({
             async move {
-                let result = parallel_write(&path, &state, &bytes).await;
+                let result = parallel_write(&path, &state).await;
                 match result {
                     Ok(crc) => {
                         println!("{:08X} {}", crc, path.display());
@@ -554,7 +580,6 @@ async fn do_write(state: Arc<State>) -> Result<()> {
     } else {
         panic!("please input a output file path");
     };
-    let bytes = Arc::new(AtomicU64::default());
 
     if let Some(input_path) = &state.args.input_path {
         let input_file = Arc::new(std::fs::File::open(input_path)?);
@@ -569,7 +594,6 @@ async fn do_write(state: Arc<State>) -> Result<()> {
                 let state = state.clone();
                 let input_file = input_file.clone();
                 let output_file = file.clone();
-                let bytes = bytes.clone();
 
                 tasks.push(tokio::task::spawn_blocking(move || {
                     TLS_BUF.with_borrow_mut(|tls| -> Result<u64> {
@@ -579,7 +603,7 @@ async fn do_write(state: Arc<State>) -> Result<()> {
                         let buf = tls.as_mut_slice();
                         let buf = &mut buf[..length as usize];
                         input_file.read_exact_at(buf, input_offset)?;
-                        Ok(write_file(&output_file, buf, output_offset, &state, &bytes)?.0)
+                        Ok(write_file(&output_file, buf, output_offset, &state)?.0)
                     })
                 }));
 
@@ -613,27 +637,31 @@ fn do_write_from_stdin(state: Arc<State>) -> Result<()> {
     } else {
         panic!("please input a output file path");
     };
-    let finished_bytes = Arc::new(AtomicU64::default());
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, u64)>(state.args.threads);
     state.runtime.spawn_blocking({
         let state = state.clone();
         let file = file.clone();
-        let finished_bytes = finished_bytes.clone();
         move || {
             while let Ok(task) = rx.recv() {
                 let state = state.clone();
                 let file = file.clone();
-                let finished_bytes = finished_bytes.clone();
                 let (mut buf, offset) = task;
                 tokio::task::spawn_blocking(move || {
+                    let start = std::time::Instant::now();
                     let _ = tls_ring_with(
                         |ring| -> Result<usize> { ring.write(&file, &buf, offset) },
                         file.mount_point(),
                         &state.args,
                     )
                     .unwrap();
-                    finished_bytes.fetch_add(buf.len() as u64, Ordering::AcqRel);
+                    state
+                        .latencies
+                        .lock()
+                        .unwrap()
+                        .record(start.elapsed().as_micros() as u64)
+                        .ok();
+                    state.bytes.fetch_add(buf.len() as u64, Ordering::AcqRel);
                     unsafe {
                         buf.set_len(buf.capacity());
                     };
@@ -668,7 +696,7 @@ fn do_write_from_stdin(state: Arc<State>) -> Result<()> {
         tx.send((buf, offset)).unwrap();
         offset += total as u64;
     }
-    while finished_bytes.load(Ordering::Acquire) < offset {
+    while state.bytes.load(Ordering::Acquire) < offset {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Ok(())
@@ -689,6 +717,8 @@ fn main() -> Result<()> {
         args,
         runtime,
         bufs: Default::default(),
+        bytes: Default::default(),
+        latencies: Arc::new(std::sync::Mutex::new(Histogram::new(3).unwrap())),
     };
     let state = Arc::new(state);
 
