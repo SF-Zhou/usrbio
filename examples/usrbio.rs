@@ -464,8 +464,8 @@ async fn bench(state: Arc<State>) -> Result<()> {
                     Ok(b) => {
                         state.bytes.fetch_add(b as u64, Ordering::AcqRel);
                     }
-                    Err(e) if is_write => eprintln!("write filed: {e}"),
-                    Err(e) => eprintln!("read filed: {e}"),
+                    Err(e) if is_write => eprintln!("write failed: {e}"),
+                    Err(e) => eprintln!("read failed: {e}"),
                 }
             }
         }));
