@@ -84,6 +84,10 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub offset: u64,
 
+    /// Alignment of offset for bench. use `bs` in default.
+    #[arg(long)]
+    pub offset_align: Option<Size>,
+
     /// Input file path for write.
     #[arg(short, long, default_value = None)]
     pub input_path: Option<PathBuf>,
@@ -415,6 +419,7 @@ async fn bench(state: Arc<State>) -> Result<()> {
         let files = files.clone();
         tasks.push(tokio::task::spawn_blocking(move || {
             let bs = state.args.bs.0;
+            let align = state.args.offset_align.map(|s| s.0).unwrap_or(bs);
             let iodepth = state.args.iodepth;
             let mount_point = files[0].0.mount_point().to_owned();
             while start_time.elapsed() <= state.args.duration.0 {
@@ -422,7 +427,8 @@ async fn bench(state: Arc<State>) -> Result<()> {
                 let mut write_jobs = Vec::with_capacity(iodepth);
                 for _ in 0..iodepth {
                     let (file, length) = files.choose(&mut rand::rng()).unwrap();
-                    let offset = rand::random::<u64>() % (length.next_multiple_of(bs) / bs) * bs;
+                    let offset =
+                        rand::random::<u64>() % (length.next_multiple_of(align) / align) * align;
                     if is_write {
                         write_jobs.push((file.clone(), &state.data[..bs as usize], offset));
                     } else {
