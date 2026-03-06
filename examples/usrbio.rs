@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use clap::{command, Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 use hdrhistogram::Histogram;
 use human_units::{Duration, Size};
 use rand::seq::IndexedRandom;
