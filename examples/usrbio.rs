@@ -407,7 +407,14 @@ async fn bench(state: Arc<State>) -> Result<()> {
             .write(is_write)
             .open_3fs_file(path)?;
         let length = file.metadata()?.len();
+        if !is_write && length == 0 {
+            continue;
+        }
         files.push((Arc::new(file), length));
+    }
+    if !is_write && files.is_empty() {
+        eprintln!("no valid file!");
+        return Err(Error::InvalidArgument);
     }
 
     print_stats(state.clone());
