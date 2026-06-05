@@ -92,6 +92,14 @@ pub struct Args {
     #[arg(short, long, default_value = None)]
     pub input_path: Option<PathBuf>,
 
+    /// File extension filter (e.g., "parquet" or ".parquet").
+    #[arg(long, default_value = None)]
+    pub extension: Option<String>,
+
+    /// Custom flags for ring.
+    #[arg(long, default_value_t = 0)]
+    pub flags: u64,
+
     /// Path.
     #[arg()]
     paths: Vec<PathBuf>,
@@ -107,6 +115,7 @@ impl Args {
             entries: self.iodepth,
             buf_size: self.buf_size(),
             numa: self.numa,
+            flags: self.flags,
             ..Default::default()
         }
     }
@@ -324,7 +333,13 @@ async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<u32> {
     Ok(full_crc)
 }
 
-fn collect_file_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn collect_file_paths(inputs: &[PathBuf], extension: &Option<String>) -> Result<Vec<PathBuf>> {
+    let ext_filter = |p: &Path| -> bool {
+        extension.as_ref().map_or(true, |e| {
+            let e = e.strip_prefix('.').unwrap_or(e);
+            p.extension().and_then(|x| x.to_str()) == Some(e)
+        })
+    };
     let mut paths = vec![];
     for path in inputs {
         let meta = path.metadata()?;
@@ -333,14 +348,16 @@ fn collect_file_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 .into_iter()
                 .flat_map(|e| e.ok())
             {
-                if entry.file_type().is_file() {
+                if entry.file_type().is_file() && ext_filter(entry.path()) {
                     paths.push(entry.path().to_owned());
                 }
             }
-        } else if path.is_file() {
+        } else if path.is_file() && ext_filter(path.as_path()) {
             paths.push(path.clone());
         }
     }
+
+    eprintln!("found {} files", paths.len());
     Ok(paths)
 }
 
@@ -393,7 +410,7 @@ fn print_stats(state: Arc<State>) {
 }
 
 async fn bench(state: Arc<State>) -> Result<()> {
-    let paths = collect_file_paths(&state.args.paths)?;
+    let paths = collect_file_paths(&state.args.paths, &state.args.extension)?;
     if paths.is_empty() {
         eprintln!("empty path!");
         return Err(Error::InvalidArgument);
@@ -492,7 +509,7 @@ async fn bench(state: Arc<State>) -> Result<()> {
 }
 
 async fn check(state: Arc<State>) -> Result<()> {
-    let paths = collect_file_paths(&state.args.paths)?;
+    let paths = collect_file_paths(&state.args.paths, &state.args.extension)?;
 
     if state.args.print_throughput {
         print_stats(state.clone());
