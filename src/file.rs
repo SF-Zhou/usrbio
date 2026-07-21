@@ -60,7 +60,7 @@ impl File {
     /// # Returns
     /// * `Result<()>` - Success or an error if registration fails
     fn register_file(file: &fs::File) -> Result<()> {
-        let ret = unsafe { super::hf3fs_reg_fd(file.as_raw_fd(), 0) };
+        let ret = unsafe { super::hf3fs_reg_fd(file.as_raw_fd(), 1) };
         if ret > 0 {
             Err(Error::RegisterFileFailed(ret))
         } else {
