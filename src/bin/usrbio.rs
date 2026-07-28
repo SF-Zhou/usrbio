@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use hdrhistogram::Histogram;
 use human_units::{Duration, Size};
 use rand::seq::IndexedRandom;
-use tokio::{runtime::Runtime, sync::Mutex, task::JoinHandle};
+use tokio::{runtime::Handle, sync::Mutex, task::JoinHandle};
 use usrbio::*;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,9 +121,18 @@ impl Args {
     }
 }
 
+/// Set by the signal handler to make benchmark loops wind down early, so that
+/// the process can go through the normal cleanup path (destroying rings and
+/// unregistering shm from the fuse daemon) instead of dying with them leaked.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn stopped() -> bool {
+    STOP.load(Ordering::Relaxed)
+}
+
 struct State {
     args: Args,
-    runtime: Runtime,
+    handle: Handle,
     data: Vec<u8>,
     bufs: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     bytes: Arc<AtomicU64>,
@@ -218,7 +227,7 @@ async fn parallel_read(path: &Path, state: &Arc<State>) -> Result<u32> {
         for idx in 0..count {
             let offset = begin + idx as u64 * buf_size;
             let expected = std::cmp::min(length - offset, buf_size);
-            tasks.push(state.runtime.spawn_blocking({
+            tasks.push(state.handle.spawn_blocking({
                 let file = file.clone();
                 let state = state.clone();
                 move || read_file(&file, offset, expected, &state)
@@ -314,7 +323,7 @@ async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<u32> {
         for idx in 0..count {
             let offset = begin + idx as u64 * buf_size;
             let expected = std::cmp::min(length - offset, buf_size);
-            tasks.push(state.runtime.spawn_blocking({
+            tasks.push(state.handle.spawn_blocking({
                 let file = file.clone();
                 let state = state.clone();
                 move || write_file(&file, &state.data[..expected as usize], offset, &state)
@@ -446,7 +455,7 @@ async fn bench(state: Arc<State>) -> Result<()> {
             let align = state.args.offset_align.map(|s| s.0).unwrap_or(bs);
             let iodepth = state.args.iodepth;
             let mount_point = files[0].0.mount_point().to_owned();
-            while start_time.elapsed() <= state.args.duration.0 {
+            while start_time.elapsed() <= state.args.duration.0 && !stopped() {
                 let mut read_jobs = Vec::with_capacity(iodepth);
                 let mut write_jobs = Vec::with_capacity(iodepth);
                 for _ in 0..iodepth {
@@ -498,6 +507,10 @@ async fn bench(state: Arc<State>) -> Result<()> {
                     Err(e) => eprintln!("read failed: {e}"),
                 }
             }
+            // Destroy this thread's rings deterministically instead of relying
+            // on the thread-local destructor, which only runs on graceful
+            // thread exit.
+            TLS.with(|v| v.borrow_mut().clear());
         }));
     }
 
@@ -519,6 +532,9 @@ async fn check(state: Arc<State>) -> Result<()> {
     let threads = state.args.threads;
     let mut tasks: VecDeque<JoinHandle<_>> = VecDeque::with_capacity(threads);
     for path in paths {
+        if stopped() {
+            break;
+        }
         while tasks.len() >= threads {
             if let Some(task) = tasks.pop_front() {
                 task.await.unwrap();
@@ -563,6 +579,9 @@ async fn gen_files(state: Arc<State>) -> Result<()> {
     let threads = state.args.threads;
     let mut tasks: VecDeque<JoinHandle<_>> = VecDeque::with_capacity(threads);
     for idx in 0..state.args.count {
+        if stopped() {
+            break;
+        }
         while tasks.len() >= threads {
             if let Some(task) = tasks.pop_front() {
                 task.await.unwrap();
@@ -669,7 +688,7 @@ fn do_write_from_stdin(state: Arc<State>) -> Result<()> {
     };
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, u64)>(state.args.threads);
-    state.runtime.spawn_blocking({
+    state.handle.spawn_blocking({
         let state = state.clone();
         let file = file.clone();
         move || {
@@ -741,27 +760,50 @@ fn main() -> Result<()> {
         .worker_threads(args.threads)
         .max_blocking_threads(args.threads)
         .enable_time()
+        .enable_io()
         .build()?;
     let state = State {
         data: vec![args.value; args.buf_size()],
+        handle: runtime.handle().clone(),
         args,
-        runtime,
         bufs: Default::default(),
         bytes: Default::default(),
         latencies: Arc::new(std::sync::Mutex::new(Histogram::new(3).unwrap())),
     };
     let state = Arc::new(state);
 
-    match &state.args.action {
-        Action::Bench => state.runtime.block_on(bench(state.clone())),
-        Action::Check => state.runtime.block_on(check(state.clone())),
-        Action::GenFiles => state.runtime.block_on(gen_files(state.clone())),
+    // Wind down gracefully on SIGINT/SIGTERM so that rings are destroyed and
+    // their shm gets unregistered from the fuse daemon and unlinked.
+    runtime.spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+        eprintln!("received termination signal, stopping...");
+        STOP.store(true, Ordering::Relaxed);
+    });
+
+    let result = match &state.args.action {
+        Action::Bench => runtime.block_on(bench(state.clone())),
+        Action::Check => runtime.block_on(check(state.clone())),
+        Action::GenFiles => runtime.block_on(gen_files(state.clone())),
         Action::WriteFile => {
             if state.args.input_path.is_some() {
-                state.runtime.block_on(do_write(state.clone()))
+                runtime.block_on(do_write(state.clone()))
             } else {
                 do_write_from_stdin(state)
             }
         }
-    }
+    };
+
+    // Shut down the runtime before exiting so that blocking-pool threads exit
+    // gracefully and run their thread-local destructors, destroying any
+    // remaining rings (hf3fs_iovdestroy/hf3fs_iordestroy). Returning from main
+    // with those threads still alive would leak the iov registrations and the
+    // hf3fs-iov-* shm files.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+
+    result
 }
