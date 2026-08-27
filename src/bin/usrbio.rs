@@ -127,14 +127,13 @@ impl Args {
 static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn stopped() -> bool {
-    STOP.load(Ordering::Relaxed)
+    STOP.load(Ordering::Acquire)
 }
 
 struct State {
     args: Args,
     handle: Handle,
     data: Vec<u8>,
-    bufs: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     bytes: Arc<AtomicU64>,
     latencies: Arc<std::sync::Mutex<Histogram<u64>>>,
 }
@@ -162,6 +161,9 @@ where
 }
 
 fn read_file(file: &File, offset: u64, length: u64, state: &State) -> Result<(u64, u32)> {
+    if stopped() {
+        return Ok((0, 0));
+    }
     let bs = state.args.bs.0;
     let start = std::time::Instant::now();
     let res = tls_ring_with(
@@ -208,7 +210,10 @@ fn read_file(file: &File, offset: u64, length: u64, state: &State) -> Result<(u6
     res
 }
 
-async fn parallel_read(path: &Path, state: &Arc<State>) -> Result<u32> {
+async fn parallel_read(path: &Path, state: &Arc<State>) -> Result<Option<u32>> {
+    if stopped() {
+        return Ok(None);
+    }
     // 1. open file.
     let file = Arc::new(File::open(&path)?);
     let length = file.metadata()?.len();
@@ -217,7 +222,7 @@ async fn parallel_read(path: &Path, state: &Arc<State>) -> Result<u32> {
     let buf_size = state.args.buf_size() as u64;
     let mut begin = 0;
     let mut full_crc = 0;
-    while begin < length {
+    while begin < length && !stopped() {
         let count = std::cmp::min(
             state.args.concurrency_limit,
             ((length - begin).next_multiple_of(buf_size) / buf_size) as usize,
@@ -225,6 +230,9 @@ async fn parallel_read(path: &Path, state: &Arc<State>) -> Result<u32> {
 
         let mut tasks = Vec::with_capacity(count);
         for idx in 0..count {
+            if stopped() {
+                break;
+            }
             let offset = begin + idx as u64 * buf_size;
             let expected = std::cmp::min(length - offset, buf_size);
             tasks.push(state.handle.spawn_blocking({
@@ -241,12 +249,14 @@ async fn parallel_read(path: &Path, state: &Arc<State>) -> Result<u32> {
             full_crc = crc32c::crc32c_combine(full_crc, crc, length as usize);
         }
     }
-    assert_eq!(begin, length);
 
-    Ok(full_crc)
+    Ok((begin == length).then_some(full_crc))
 }
 
 fn write_file(file: &File, data: &[u8], offset: u64, state: &State) -> Result<(u64, u32)> {
+    if stopped() {
+        return Ok((0, 0));
+    }
     let length = data.len() as u64;
     let bs = state.args.bs.0;
     let start = std::time::Instant::now();
@@ -297,7 +307,10 @@ fn write_file(file: &File, data: &[u8], offset: u64, state: &State) -> Result<(u
     res
 }
 
-async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<u32> {
+async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<Option<u32>> {
+    if stopped() {
+        return Ok(None);
+    }
     // 1. open file.
     let file = Arc::new(
         std::fs::OpenOptions::new()
@@ -313,7 +326,7 @@ async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<u32> {
     let buf_size = state.args.buf_size() as u64;
     let mut begin = 0;
     let mut full_crc = 0;
-    while begin < length {
+    while begin < length && !stopped() {
         let count = std::cmp::min(
             state.args.concurrency_limit,
             ((length - begin).next_multiple_of(buf_size) / buf_size) as usize,
@@ -321,6 +334,9 @@ async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<u32> {
 
         let mut tasks = Vec::with_capacity(count);
         for idx in 0..count {
+            if stopped() {
+                break;
+            }
             let offset = begin + idx as u64 * buf_size;
             let expected = std::cmp::min(length - offset, buf_size);
             tasks.push(state.handle.spawn_blocking({
@@ -337,9 +353,8 @@ async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<u32> {
             full_crc = crc32c::crc32c_combine(full_crc, crc, length as usize);
         }
     }
-    assert_eq!(begin, length);
 
-    Ok(full_crc)
+    Ok((begin == length).then_some(full_crc))
 }
 
 fn collect_file_paths(inputs: &[PathBuf], extension: &Option<String>) -> Result<Vec<PathBuf>> {
@@ -351,12 +366,18 @@ fn collect_file_paths(inputs: &[PathBuf], extension: &Option<String>) -> Result<
     };
     let mut paths = vec![];
     for path in inputs {
+        if stopped() {
+            break;
+        }
         let meta = path.metadata()?;
         if meta.is_dir() {
             for entry in walkdir::WalkDir::new(&path)
                 .into_iter()
                 .flat_map(|e| e.ok())
             {
+                if stopped() {
+                    break;
+                }
                 if entry.file_type().is_file() && ext_filter(entry.path()) {
                     paths.push(entry.path().to_owned());
                 }
@@ -375,6 +396,9 @@ fn print_stats(state: Arc<State>) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
+            if stopped() {
+                break;
+            }
             let b = state.bytes.swap(0, Ordering::AcqRel);
             let mut h = state.latencies.lock().unwrap();
             let (avg, p50, p90, p99, max) = if h.len() > 0 {
@@ -420,6 +444,9 @@ fn print_stats(state: Arc<State>) {
 
 async fn bench(state: Arc<State>) -> Result<()> {
     let paths = collect_file_paths(&state.args.paths, &state.args.extension)?;
+    if stopped() {
+        return Ok(());
+    }
     if paths.is_empty() {
         eprintln!("empty path!");
         return Err(Error::InvalidArgument);
@@ -428,6 +455,9 @@ async fn bench(state: Arc<State>) -> Result<()> {
     let is_write = state.args.write;
     let mut files = Vec::with_capacity(paths.len());
     for path in &paths {
+        if stopped() {
+            break;
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(is_write)
@@ -437,6 +467,9 @@ async fn bench(state: Arc<State>) -> Result<()> {
             continue;
         }
         files.push((Arc::new(file), length));
+    }
+    if stopped() {
+        return Ok(());
     }
     if !is_write && files.is_empty() {
         eprintln!("no valid file!");
@@ -459,6 +492,9 @@ async fn bench(state: Arc<State>) -> Result<()> {
                 let mut read_jobs = Vec::with_capacity(iodepth);
                 let mut write_jobs = Vec::with_capacity(iodepth);
                 for _ in 0..iodepth {
+                    if stopped() {
+                        break;
+                    }
                     let (file, length) = files.choose(&mut rand::rng()).unwrap();
                     let offset =
                         rand::random::<u64>() % (length.next_multiple_of(align) / align) * align;
@@ -467,6 +503,10 @@ async fn bench(state: Arc<State>) -> Result<()> {
                     } else {
                         read_jobs.push((file.clone(), offset, bs as usize));
                     }
+                }
+
+                if stopped() {
+                    break;
                 }
 
                 let start = std::time::Instant::now();
@@ -548,9 +588,10 @@ async fn check(state: Arc<State>) -> Result<()> {
             async move {
                 let result = parallel_read(&path, &state).await;
                 match result {
-                    Ok(crc) => {
+                    Ok(Some(crc)) => {
                         println!("{:08X} {}", crc, path.display());
                     }
+                    Ok(None) => {}
                     Err(err) => {
                         eprintln!("read {} error: {}", path.display(), err);
                         *first_error.lock().await = Some(err);
@@ -595,9 +636,10 @@ async fn gen_files(state: Arc<State>) -> Result<()> {
             async move {
                 let result = parallel_write(&path, &state).await;
                 match result {
-                    Ok(crc) => {
+                    Ok(Some(crc)) => {
                         println!("{:08X} {}", crc, path.display());
                     }
+                    Ok(None) => {}
                     Err(err) => {
                         eprintln!("write {} error: {}", path.display(), err);
                         *first_error.lock().await = Some(err);
@@ -635,9 +677,12 @@ async fn do_write(state: Arc<State>) -> Result<()> {
         let input_length = input_file.metadata()?.len();
         let mut input_offset = 0;
         let mut output_offset = state.args.offset;
-        while input_offset < input_length {
+        while input_offset < input_length && !stopped() {
             let mut tasks = vec![];
             for _ in 0..state.args.threads {
+                if stopped() {
+                    break;
+                }
                 let buf_size = state.args.buf_size();
                 let length = std::cmp::min(input_length - input_offset, buf_size as u64);
                 let state = state.clone();
@@ -646,6 +691,9 @@ async fn do_write(state: Arc<State>) -> Result<()> {
 
                 tasks.push(tokio::task::spawn_blocking(move || {
                     TLS_BUF.with_borrow_mut(|tls| -> Result<u64> {
+                        if stopped() {
+                            return Ok(0);
+                        }
                         if tls.len() != buf_size {
                             tls.resize(buf_size, 0);
                         }
@@ -687,68 +735,102 @@ fn do_write_from_stdin(state: Arc<State>) -> Result<()> {
         panic!("please input a output file path");
     };
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, u64)>(state.args.threads);
-    state.handle.spawn_blocking({
-        let state = state.clone();
-        let file = file.clone();
-        move || {
-            while let Ok(task) = rx.recv() {
-                let state = state.clone();
-                let file = file.clone();
-                let (mut buf, offset) = task;
-                tokio::task::spawn_blocking(move || {
-                    let start = std::time::Instant::now();
-                    let _ = tls_ring_with(
-                        |ring| -> Result<usize> { ring.write(&file, &buf, offset) },
-                        file.mount_point(),
-                        &state.args,
-                    )
-                    .unwrap();
-                    state
-                        .latencies
-                        .lock()
-                        .unwrap()
-                        .record(start.elapsed().as_micros() as u64)
-                        .ok();
-                    state.bytes.fetch_add(buf.len() as u64, Ordering::AcqRel);
-                    unsafe {
-                        buf.set_len(buf.capacity());
-                    };
-                    state.bufs.lock().unwrap().push(buf);
-                });
+    // Keep a potentially blocking stdin read away from the control flow that
+    // observes STOP. The process can then wind down even if stdin stays open.
+    let mut offset = state.args.offset;
+    let buf_size = state.args.buf_size();
+    let (input_tx, input_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        while !stopped() {
+            let mut buf = vec![0u8; buf_size];
+            let mut total = 0;
+            while total < buf_size && !stopped() {
+                match handle.read(&mut buf[total..]) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(err) => {
+                        let _ = input_tx.send(Err(err));
+                        return;
+                    }
+                }
+            }
+            buf.truncate(total);
+            if total > 0 && input_tx.send(Ok(Some(buf))).is_err() {
+                return;
+            }
+            if total == 0 {
+                let _ = input_tx.send(Ok(None));
+                return;
             }
         }
     });
 
-    let stdin = std::io::stdin();
-    let mut handle = stdin.lock();
-    let mut offset = state.args.offset;
-    let buf_size = state.args.buf_size();
-    let mut finished = false;
-    while !finished {
-        let mut buf = if let Some(buf) = state.bufs.lock().unwrap().pop() {
-            buf
-        } else {
-            vec![0u8; buf_size]
-        };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let mut in_flight = 0;
+    let mut first_error = None;
+    loop {
+        while in_flight >= state.args.threads {
+            match done_rx.recv().unwrap() {
+                Ok(()) => {}
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+            in_flight -= 1;
+        }
 
-        let mut total = 0;
-        while total < buf_size {
-            let n = handle.read(&mut buf[total..])?;
-            if n == 0 {
-                finished = true;
+        let buf = match input_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Ok(Some(buf))) if !stopped() => buf,
+            Ok(Ok(Some(_))) | Ok(Ok(None)) => break,
+            Ok(Err(err)) => {
+                first_error = Some(err.into());
                 break;
             }
-            total += n;
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !stopped() => continue,
+            Err(_) => break,
+        };
+        let length = buf.len() as u64;
+        let state = state.clone();
+        let file = file.clone();
+        let done_tx = done_tx.clone();
+        let handle = state.handle.clone();
+        handle.spawn_blocking(move || {
+            let start = std::time::Instant::now();
+            let result = if stopped() {
+                Ok(false)
+            } else {
+                tls_ring_with(
+                    |ring| -> Result<usize> { ring.write(&file, &buf, offset) },
+                    file.mount_point(),
+                    &state.args,
+                )
+                .map(|_| true)
+            };
+            state
+                .latencies
+                .lock()
+                .unwrap()
+                .record(start.elapsed().as_micros() as u64)
+                .ok();
+            if matches!(&result, Ok(true)) {
+                state.bytes.fetch_add(buf.len() as u64, Ordering::AcqRel);
+            }
+            let _ = done_tx.send(result.map(|_| ()));
+        });
+        in_flight += 1;
+        offset += length;
+    }
+
+    while in_flight > 0 {
+        match done_rx.recv().unwrap() {
+            Ok(()) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
         }
-        buf.resize(total, 0);
-        tx.send((buf, offset)).unwrap();
-        offset += total as u64;
+        in_flight -= 1;
     }
-    while state.bytes.load(Ordering::Acquire) < offset {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    Ok(())
+    first_error.map(Err).unwrap_or(Ok(()))
 }
 
 fn main() -> Result<()> {
@@ -766,7 +848,6 @@ fn main() -> Result<()> {
         data: vec![args.value; args.buf_size()],
         handle: runtime.handle().clone(),
         args,
-        bufs: Default::default(),
         bytes: Default::default(),
         latencies: Arc::new(std::sync::Mutex::new(Histogram::new(3).unwrap())),
     };
@@ -782,7 +863,7 @@ fn main() -> Result<()> {
             _ = sigterm.recv() => {}
         }
         eprintln!("received termination signal, stopping...");
-        STOP.store(true, Ordering::Relaxed);
+        STOP.store(true, Ordering::Release);
     });
 
     let result = match &state.args.action {
