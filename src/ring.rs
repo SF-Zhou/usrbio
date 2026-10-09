@@ -19,6 +19,10 @@ pub struct RingConfig {
     pub flags: u64,
     /// Block size for I/O operations
     pub block_size: usize,
+    /// Unlink the data buffer's `/dev/shm/hf3fs-iov-*` file once it is registered,
+    /// so the kernel reclaims it even if destructors never run. Defaults to true;
+    /// see [`Iov::unlink`].
+    pub unlink_iov: bool,
 }
 
 impl Default for RingConfig {
@@ -31,6 +35,7 @@ impl Default for RingConfig {
             numa: -1,
             flags: 0,
             block_size: 0,
+            unlink_iov: true,
         }
     }
 }
@@ -73,7 +78,10 @@ impl Ring {
             config.numa,
             config.flags,
         )?;
-        let iov = Iov::create(mount_point, config.buf_size, config.block_size, config.numa)?;
+        let mut iov = Iov::create(mount_point, config.buf_size, config.block_size, config.numa)?;
+        if config.unlink_iov {
+            iov.unlink();
+        }
 
         Ok(Self {
             config: config.clone(),
