@@ -187,9 +187,17 @@ impl Ring {
         }
 
         for cqe in &self.cqes {
-            let result = &mut results[cqe.userdata as usize];
+            let idx = cqe.userdata as usize;
+            let result = results.get_mut(idx).ok_or(Error::InvalidUserData(idx))?;
+            if cqe.result > result.buf.len() as i64 {
+                return Err(Error::ReadLengthExceeded {
+                    expected: result.buf.len(),
+                    actual: cqe.result,
+                });
+            }
+            let len = cqe.result.max(0) as usize;
             result.ret = cqe.result;
-            result.buf = &result.buf[..std::cmp::max(0, cqe.result) as usize];
+            result.buf = &result.buf[..len];
         }
         Ok(results)
     }
@@ -289,7 +297,8 @@ impl Ring {
         }
 
         for cqe in &self.cqes {
-            results[cqe.userdata as usize] = cqe.result;
+            let idx = cqe.userdata as usize;
+            *results.get_mut(idx).ok_or(Error::InvalidUserData(idx))? = cqe.result;
         }
         Ok(results)
     }

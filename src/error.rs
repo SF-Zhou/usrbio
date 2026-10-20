@@ -10,6 +10,8 @@ pub enum Error {
     WaitForIOsFailed(i32),
     ReadFailed(i32),
     WriteFailed(i32),
+    ReadLengthExceeded { expected: usize, actual: i64 },
+    InvalidUserData(usize),
     InvalidArgument,
     InsufficientEntriesLength,
     InsufficientBufferLength,
@@ -27,6 +29,7 @@ impl Error {
             | Error::WaitForIOsFailed(errno)
             | Error::ReadFailed(errno)
             | Error::WriteFailed(errno) => *errno,
+            Error::ReadLengthExceeded { .. } | Error::InvalidUserData(_) => 5,
             _ => 22,
         }
     }
