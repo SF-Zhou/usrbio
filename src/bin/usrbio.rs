@@ -1,3 +1,7 @@
+//! Command-line benchmarks, checksum reads, and file writes for 3FS.
+//!
+//! Build with the `bin` feature and run `usrbio --help` for options.
+
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -17,90 +21,98 @@ use rand::seq::IndexedRandom;
 use tokio::{runtime::Handle, sync::Mutex, task::JoinHandle};
 use usrbio::*;
 
+/// Operation selected by `--action`.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// Benchmark random reads, or random writes with --write.
     Bench,
+    /// Read files and print their CRC32C checksums.
     Check,
+    /// Create or overwrite numbered files filled with --value.
     GenFiles,
+    /// Write --input-path or stdin to one destination without truncating it.
     WriteFile,
 }
 
+/// Command-line options shared by the supported actions.
 #[derive(Parser, Debug, Clone)]
 #[command(version, about = "usrbio tools", long_about = None)]
 pub struct Args {
-    /// Action.
+    /// Operation to perform.
     #[arg(short, long, default_value = "bench")]
     pub action: Action,
 
-    /// Total number of threads.
+    /// Thread limit for each Tokio worker and blocking pool.
     #[arg(long, default_value_t = 32)]
     pub threads: usize,
 
-    /// Concurrency limit for a single file. Use `threads` in default.
+    /// Concurrent batches per file for check and gen-files; 0 uses --threads.
     #[arg(long, default_value_t = 0)]
     pub concurrency_limit: usize,
 
-    /// Block size.
+    /// Block size for batched I/O, with size suffixes such as 512k or 1M.
+    ///
+    /// For stdin writes, each request uses up to --bs * --iodepth bytes.
     #[arg(long, value_parser=clap::value_parser!(Size), default_value = "512k")]
     pub bs: Size,
 
-    /// IO depth.
+    /// Ring entry count and maximum number of requests per batch.
     #[arg(long, default_value_t = 32)]
     pub iodepth: usize,
 
-    /// Duration for bench.
+    /// Benchmark duration, with units such as 10s or 1m.
     #[arg(long, value_parser=clap::value_parser!(Duration), default_value = "60s")]
     pub duration: Duration,
 
-    /// Byte content for generate files.
+    /// Byte value used by gen-files and write benchmarks.
     #[arg(long, default_value_t = 0)]
     pub value: u8,
 
-    /// File count for generate files.
+    /// Number of files to create with gen-files.
     #[arg(long, default_value_t = 1)]
     pub count: usize,
 
-    /// File length for generate files.
+    /// Size of each file created with gen-files.
     #[arg(long, value_parser=clap::value_parser!(Size), default_value = "16M")]
     pub length: Size,
 
-    /// Filename prefix for generate files.
+    /// Prefix before each numeric filename created with gen-files.
     #[arg(long, default_value = "")]
     pub prefix: String,
 
-    /// Whether to print throughput.
+    /// Print throughput and batch latency for check and gen-files.
     #[arg(long, default_value_t = false)]
     pub print_throughput: bool,
 
-    /// Write stress test.
+    /// Benchmark writes instead of reads, overwriting data in the selected files.
     #[arg(long, default_value_t = false)]
     pub write: bool,
 
-    /// Numa. -1 for no NUMA awareness.
+    /// NUMA node for shared-memory allocation; -1 disables node binding.
     #[arg(long, default_value_t = -1)]
     pub numa: i32,
 
-    /// Offset for write.
+    /// Destination byte offset for write-file.
     #[arg(long, default_value_t = 0)]
     pub offset: u64,
 
-    /// Alignment of offset for bench. use `bs` in default.
+    /// Benchmark byte-offset alignment; defaults to --bs.
     #[arg(long)]
     pub offset_align: Option<Size>,
 
-    /// Input file path for write.
+    /// Source file for write-file; omit to read from stdin.
     #[arg(short, long, default_value = None)]
     pub input_path: Option<PathBuf>,
 
-    /// File extension filter (e.g., "parquet" or ".parquet").
+    /// File extension filter for bench and check (e.g., parquet or .parquet).
     #[arg(long, default_value = None)]
     pub extension: Option<String>,
 
-    /// Custom flags for ring.
+    /// 3FS I/O ring flags as a decimal bitmask.
     #[arg(long, default_value_t = 0)]
     pub flags: u64,
 
-    /// Path.
+    /// Files or directories for bench/check, or the destination for gen-files/write-file.
     #[arg()]
     paths: Vec<PathBuf>,
 }
@@ -121,9 +133,8 @@ impl Args {
     }
 }
 
-/// Set by the signal handler to make benchmark loops wind down early, so that
-/// the process can go through the normal cleanup path (destroying rings and
-/// unregistering shm from the fuse daemon) instead of dying with them leaked.
+/// Set by the signal-listening task to stop scheduling work and allow in-flight
+/// operations to finish before rings and shared-memory registrations are dropped.
 static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn stopped() -> bool {
@@ -214,11 +225,11 @@ async fn parallel_read(path: &Path, state: &Arc<State>) -> Result<Option<u32>> {
     if stopped() {
         return Ok(None);
     }
-    // 1. open file.
+    // Keep the registered file alive until all read tasks finish.
     let file = Arc::new(File::open(&path)?);
     let length = file.metadata()?.len();
 
-    // 2. read file.
+    // Each task reads one ring-sized batch; combine checksums in file-offset order.
     let buf_size = state.args.buf_size() as u64;
     let mut begin = 0;
     let mut full_crc = 0;
@@ -311,7 +322,7 @@ async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<Option<u32>> 
     if stopped() {
         return Ok(None);
     }
-    // 1. open file.
+    // Recreate each generated file and retain its registration across write tasks.
     let file = Arc::new(
         std::fs::OpenOptions::new()
             .create(true)
@@ -322,7 +333,7 @@ async fn parallel_write(path: &Path, state: &Arc<State>) -> Result<Option<u32>> 
     );
     let length = state.args.length.0;
 
-    // 2. write file.
+    // Split the output into batches that fit the ring's shared-memory buffer.
     let buf_size = state.args.buf_size() as u64;
     let mut begin = 0;
     let mut full_crc = 0;
@@ -879,11 +890,8 @@ fn main() -> Result<()> {
         }
     };
 
-    // Shut down the runtime before exiting so that blocking-pool threads exit
-    // gracefully and run their thread-local destructors, destroying any
-    // remaining rings (hf3fs_iovdestroy/hf3fs_iordestroy). Returning from main
-    // with those threads still alive would leak the iov registrations and the
-    // hf3fs-iov-* shm files.
+    // Give blocking-pool threads up to ten seconds to finish and run their
+    // thread-local destructors, releasing any remaining rings and registrations.
     runtime.shutdown_timeout(std::time::Duration::from_secs(10));
 
     result

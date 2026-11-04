@@ -2,9 +2,11 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    // Link to an externally installed 3FS client library; this crate does not build it.
     println!("cargo:rustc-link-lib=dylib=hf3fs_api_shared");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // Generate bindings from the bundled header into Cargo's build output directory.
     bindgen::Builder::default()
         .header("include/hf3fs_usrbio.h")
         .derive_copy(true)

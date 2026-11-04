@@ -1,27 +1,51 @@
 use crate::{job::ReadResult, *};
 use std::{ops::Deref, os::fd::AsRawFd, path::Path};
 
-/// Configuration parameters for the I/O ring.
-/// This structure defines the settings used to create and configure an I/O ring.
+/// Shared-memory and batching settings used by [`Ring`] and [`ReadWorker`].
+///
+/// The defaults allow up to 1,024 jobs and 4 MiB of data per batch, with no
+/// fixed batch size or NUMA placement.
 #[derive(Debug, Clone)]
 pub struct RingConfig {
-    /// Number of entries in the ring buffer
+    /// Maximum number of jobs per batch. Defaults to 1,024.
+    ///
+    /// Must be positive and fit in an `i32`, as required by the C API.
     pub entries: usize,
-    /// Size of the I/O buffer in bytes
+    /// Size of the shared data buffer in bytes. Defaults to 4 MiB.
+    ///
+    /// Must be nonzero. The sum of requested lengths in a batch must fit here.
     pub buf_size: usize,
-    /// Maximum I/O depth for concurrent operations
+    /// Controls how the 3FS worker groups prepared requests. Defaults to `0`.
+    ///
+    /// `0` processes available requests without a fixed batch size. A positive
+    /// value waits for groups of exactly that many requests; each batch must
+    /// contain a multiple of that many nonempty jobs to avoid waiting forever.
+    /// A negative value processes at most `-io_depth` requests per group,
+    /// optionally waiting for more requests according to [`Self::timeout`].
     pub io_depth: i32,
-    /// Timeout value for I/O operations
+    /// Maximum batching delay in milliseconds when [`Self::io_depth`] is negative.
+    ///
+    /// Must be nonnegative. `0` (the default) disables this delay. This setting
+    /// is not a deadline for completing I/O; [`Ring`] waits without a completion
+    /// timeout.
     pub timeout: i32,
-    /// NUMA node identifier (-1 for no NUMA awareness)
+    /// NUMA node for shared-memory allocation, or `-1` for no explicit placement.
+    /// Defaults to `-1`.
     pub numa: i32,
-    /// Additional flags for ring configuration
+    /// Flags passed to the 3FS read and write rings. Defaults to `0`.
+    ///
+    /// See [`HF3FS_IOR_ALLOW_READ_UNCOMMITTED`] and [`HF3FS_IOR_FORBID_READ_HOLES`].
     pub flags: u64,
-    /// Block size for I/O operations
+    /// Shared-memory registration block size in bytes.
+    ///
+    /// `0` (the default) registers the whole buffer as one block. A nonzero
+    /// value must not exceed [`Self::buf_size`]. Each job's data must fit within
+    /// one registration block; [`Ring`] packs jobs consecutively without adding
+    /// padding or splitting requests at block boundaries.
     pub block_size: usize,
-    /// Unlink the data buffer's `/dev/shm/hf3fs-iov-*` file once it is registered,
-    /// so the kernel reclaims it even if destructors never run. Defaults to true;
-    /// see [`Iov::unlink`].
+    /// Unlink the data buffer's `/dev/shm/hf3fs-iov-*` file after registration,
+    /// while keeping the mapping and registration alive. Defaults to `true`;
+    /// see [`Iov::unlink`] for lifecycle details.
     pub unlink_iov: bool,
 }
 
@@ -40,8 +64,15 @@ impl Default for RingConfig {
     }
 }
 
-/// An I/O ring that manages asynchronous read and write operations.
-/// Provides facilities for both single and batch I/O operations with configurable parameters.
+/// Blocking single and batch I/O over 3FS shared-memory rings.
+///
+/// A `Ring` owns separate read and write rings and one shared data buffer for a
+/// single 3FS mount. Successful calls return after their requests complete. Use
+/// [`ReadWorker`] or [`ReadWorkers`] to perform reads on background threads.
+///
+/// Read results borrow the shared buffer, so they must be consumed or copied
+/// before the ring can be used again. All files in an operation must belong to
+/// the mount passed to [`Ring::create`].
 pub struct Ring {
     config: RingConfig,
     read_ior: Ior,
@@ -51,14 +82,19 @@ pub struct Ring {
 }
 
 impl Ring {
-    /// Creates a new I/O ring with the specified configuration and mount point.
+    /// Creates read and write rings and a shared data buffer for `mount_point`.
     ///
-    /// # Arguments
-    /// * `config` - Ring configuration parameters
-    /// * `mount_point` - Mount point path for the filesystem
+    /// Obtain the mount point from [`File::mount_point`]. The configuration is
+    /// cloned, so subsequent changes to `config` do not affect this ring.
     ///
-    /// # Returns
-    /// * `Result<Self>` - A new Ring instance or an error
+    /// # Errors
+    ///
+    /// Returns an error if 3FS cannot create either ring or allocate and register
+    /// the shared data buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mount_point` contains an interior NUL byte.
     pub fn create(config: &RingConfig, mount_point: &Path) -> Result<Self> {
         let read_ior = Ior::create(
             mount_point,
@@ -92,15 +128,16 @@ impl Ring {
         })
     }
 
-    /// Performs a single read operation.
+    /// Reads up to `length` bytes at the byte `offset`, waiting for completion.
     ///
-    /// # Arguments
-    /// * `file` - The file to read from
-    /// * `offset` - Starting position for the read
-    /// * `length` - Number of bytes to read
+    /// The returned slice borrows this ring's shared buffer and may be shorter
+    /// than requested, for example at end of file. A zero-length request returns
+    /// an empty slice. The file cursor is not changed.
     ///
-    /// # Returns
-    /// * `Result<&[u8]>` - The read data as a byte slice or an error
+    /// # Errors
+    ///
+    /// Returns errors from [`Self::batch_read`], or [`Error::ReadFailed`] if the
+    /// individual read fails.
     pub fn read(&mut self, file: &File, offset: u64, length: usize) -> Result<&[u8]> {
         let results = self.batch_read(&[(file, offset, length)])?;
         match &results[0] {
@@ -109,17 +146,25 @@ impl Ring {
         }
     }
 
-    /// Performs multiple read operations in a batch.
+    /// Reads a batch and waits for all nonempty requests to complete.
     ///
-    /// # Arguments
-    /// * `jobs` - Slice of read operations to perform
+    /// Jobs may be tuples of `(&File, offset, length)`; see [`ReadJob`]. All files
+    /// must belong to this ring's mount. Results are returned in input order,
+    /// even if requests complete out of order. Zero-length jobs succeed with an
+    /// empty buffer and are not submitted to 3FS.
     ///
-    /// # Returns
-    /// * `Result<Vec<ReadResult<'_>>>` - Vector of read results or an error
+    /// Each result borrows this ring's shared buffer. Check [`ReadResult::ret`]
+    /// for individual failures: an `Ok` batch can still contain negative error
+    /// codes, and successful reads may be shorter than requested.
     ///
     /// # Errors
-    /// * Returns error if number of jobs exceeds ring entries
-    /// * Returns error if total read length exceeds buffer size
+    ///
+    /// Returns [`Error::InsufficientEntriesLength`] if the job count exceeds
+    /// [`RingConfig::entries`], or [`Error::InsufficientBufferLength`] if the sum
+    /// of requested lengths exceeds [`RingConfig::buf_size`]. Also returns
+    /// errors for failed preparation, submission, or completion waiting, and
+    /// for invalid completion metadata. Errors do not roll back reads already
+    /// prepared or submitted, or cancel and drain outstanding requests.
     pub fn batch_read(&mut self, jobs: &[impl ReadJob]) -> Result<Vec<ReadResult<'_>>> {
         let count = jobs.len();
         if count > self.config.entries {
@@ -186,6 +231,7 @@ impl Ring {
             return Err(Error::WaitForIOsFailed(-ret));
         }
 
+        // The original job index travels in userdata; completion order may differ.
         for cqe in &self.cqes {
             let idx = cqe.userdata as usize;
             let result = results.get_mut(idx).ok_or(Error::InvalidUserData(idx))?;
@@ -202,15 +248,16 @@ impl Ring {
         Ok(results)
     }
 
-    /// Performs a single write operation.
+    /// Writes `buf` at the byte `offset`, waiting for completion.
     ///
-    /// # Arguments
-    /// * `file` - The file to write to
-    /// * `buf` - Data to write
-    /// * `offset` - Starting position for the write
+    /// Copies the data into this ring's shared buffer before submitting it.
+    /// Returns the number of bytes written, which may be less than `buf.len()`.
+    /// An empty buffer returns `0`. The file cursor is not changed.
     ///
-    /// # Returns
-    /// * `Result<usize>` - Number of bytes written or an error
+    /// # Errors
+    ///
+    /// Returns errors from [`Self::batch_write`], or [`Error::WriteFailed`] if the
+    /// individual write fails.
     pub fn write(&mut self, file: &File, buf: &[u8], offset: u64) -> Result<usize> {
         let results = self.batch_write(&[(file, buf, offset)])?;
         match results[0] {
@@ -219,17 +266,25 @@ impl Ring {
         }
     }
 
-    /// Performs multiple write operations in a batch.
+    /// Writes a batch and waits for all nonempty requests to complete.
     ///
-    /// # Arguments
-    /// * `jobs` - Slice of write operations to perform
+    /// Jobs may be tuples of `(&File, data, offset)`; see [`WriteJob`]. All files
+    /// must belong to this ring's mount. Data is copied into the shared buffer
+    /// before submission. Empty writes succeed with `0` and are not submitted.
     ///
-    /// # Returns
-    /// * `Result<Vec<i64>>` - Vector of write results (bytes written) or an error
+    /// Results are returned in input order. Each value is a nonnegative byte
+    /// count or a negative error code from 3FS; an `Ok` batch does not imply that
+    /// every write succeeded or wrote all requested bytes. The batch is not
+    /// atomic, and overlapping writes have no guaranteed execution order.
     ///
     /// # Errors
-    /// * Returns error if number of jobs exceeds ring entries
-    /// * Returns error if total write length exceeds buffer size
+    ///
+    /// Returns [`Error::InsufficientEntriesLength`] if the job count exceeds
+    /// [`RingConfig::entries`], or [`Error::InsufficientBufferLength`] if the sum
+    /// of data lengths exceeds [`RingConfig::buf_size`]. Also returns errors
+    /// for failed preparation, submission, or completion waiting, and for
+    /// invalid completion metadata. Errors do not roll back writes already
+    /// prepared or submitted, or cancel and drain outstanding requests.
     pub fn batch_write(&mut self, jobs: &[impl WriteJob]) -> Result<Vec<i64>> {
         let count = jobs.len();
         if count > self.config.entries {

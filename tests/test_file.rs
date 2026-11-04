@@ -1,3 +1,9 @@
+//! Integration tests against a mounted 3FS filesystem.
+//!
+//! Set `USRBIO_3FS_TEST_DIR` when compiling these tests. Without it, the tests
+//! return early. Use a dedicated, existing directory: test files are overwritten
+//! and left in place after the tests finish.
+
 use std::{
     path::Path,
     sync::{atomic::AtomicBool, Arc},

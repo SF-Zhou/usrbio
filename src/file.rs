@@ -7,8 +7,12 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-/// A wrapper around the standard `fs::File` with additional 3fs-specific functionality.
-/// This struct manages file operations and mount point tracking for the 3fs filesystem.
+/// A file registered for USRBIO, together with its 3FS mount point.
+///
+/// Dereferences to [`std::fs::File`] for metadata and standard file operations.
+/// Dropping this wrapper deregisters the descriptor before closing it. Keep the
+/// wrapped descriptor unchanged for the wrapper's lifetime; replacing the inner
+/// file through mutable dereferencing bypasses registration bookkeeping.
 #[derive(Debug)]
 pub struct File {
     file: fs::File,
@@ -16,51 +20,47 @@ pub struct File {
 }
 
 impl File {
-    /// Creates a new `File` instance with the specified mount point.
+    /// Registers an open file using an already known 3FS mount point.
+    ///
+    /// Prefer [`File::open`] or [`Open3fsFile::open_3fs_file`] when the mount point
+    /// has not already been resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RegisterFileFailed`] if descriptor registration fails.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the provided mount_point is valid and corresponds to the file.
-    ///
-    /// # Arguments
-    /// * `file` - A standard filesystem file
-    /// * `mount_point` - The mount point path for the file
-    ///
-    /// # Returns
-    /// * `Result<File>` - A new File instance or an error
+    /// `mount_point` must identify the 3FS mount containing `file`. The descriptor
+    /// must not be closed or deregistered externally while this wrapper is alive.
     pub unsafe fn new(file: fs::File, mount_point: PathBuf) -> Result<File> {
         File::register_file(&file)?;
         Ok(File { file, mount_point })
     }
 
-    /// Opens a file in read-only mode.
+    /// Opens a 3FS file for reading and registers it for USRBIO.
     ///
-    /// # Arguments
-    /// * `path` - The path to the file to open
+    /// Uses [`Open3fsFile::open_3fs_file`] to resolve the mount point. Use that
+    /// method with [`std::fs::OpenOptions`] to open files for writing or creation.
     ///
-    /// # Returns
-    /// * `Result<File>` - The opened file or an error
+    /// # Errors
+    ///
+    /// Returns an error if opening the file, resolving its 3FS mount point, or
+    /// registering its descriptor fails.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<File> {
         fs::OpenOptions::new().read(true).open_3fs_file(path)
     }
 
-    /// Returns the mount point of the file.
-    ///
-    /// # Returns
-    /// * `&Path` - Reference to the mount point path
+    /// Returns the 3FS mount point used to register this file.
     pub fn mount_point(&self) -> &Path {
         &self.mount_point
     }
 
-    /// Registers the file with the 3fs system.
-    ///
-    /// # Arguments
-    /// * `file` - The file to register
-    ///
-    /// # Returns
-    /// * `Result<()>` - Success or an error if registration fails
     fn register_file(file: &fs::File) -> Result<()> {
+        // Flag 1 disables descriptor duplication; this wrapper owns the original
+        // descriptor and deregisters it before std::fs::File closes it.
         let ret = unsafe { super::hf3fs_reg_fd(file.as_raw_fd(), 1) };
+        // Unlike the I/O functions, registration returns a positive errno.
         if ret > 0 {
             Err(Error::RegisterFileFailed(ret))
         } else {
@@ -68,13 +68,15 @@ impl File {
         }
     }
 
-    /// Extracts the mount point from a given path.
+    /// Resolves the 3FS mount point containing `path`.
     ///
-    /// # Arguments
-    /// * `path` - The path to extract the mount point from
+    /// Pass a canonical, absolute path so the output buffer, which is sized from
+    /// the input path, can hold the mount point.
     ///
-    /// # Returns
-    /// * `Result<PathBuf>` - The extracted mount point or an error
+    /// # Errors
+    ///
+    /// Returns [`Error::ExtractMountPointFailed`] if the native API cannot
+    /// identify a 3FS mount for the path.
     pub fn extract_mount_point(path: impl AsRef<Path>) -> Result<PathBuf> {
         let mut bytes = Vec::from(path.as_ref().as_os_str().as_bytes());
         bytes.push(0);
@@ -95,14 +97,15 @@ impl File {
         Ok(PathBuf::from(OsString::from_vec(out)))
     }
 
-    /// Extracts the mount point from a path with caching support.
-    /// Maintains a cache of known mount points to avoid repeated extractions.
+    /// Resolves a mount point, reusing a process-wide cache of known mounts.
     ///
-    /// # Arguments
-    /// * `path` - The path to extract the mount point from
+    /// Pass a canonical, absolute path. Cache hits use path-prefix matching and
+    /// do not query the filesystem again. The cache is never invalidated, so it
+    /// assumes the mount layout remains stable during the process lifetime.
     ///
-    /// # Returns
-    /// * `Result<PathBuf>` - The extracted mount point or an error
+    /// # Errors
+    ///
+    /// Returns errors from [`File::extract_mount_point`] on a cache miss.
     pub fn extract_mount_point_with_cache(path: impl AsRef<Path>) -> Result<PathBuf> {
         fn cache() -> &'static RwLock<Vec<PathBuf>> {
             static CACHE: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
@@ -130,6 +133,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
+        // Deregister while the descriptor is still open; fields drop afterwards.
         unsafe { super::hf3fs_dereg_fd(self.as_raw_fd()) };
     }
 }
@@ -148,16 +152,19 @@ impl DerefMut for File {
     }
 }
 
-/// Trait for opening files in the 3fs filesystem.
-/// This trait extends the standard file opening capabilities with 3fs-specific functionality.
+/// Extends [`std::fs::OpenOptions`] with 3FS mount discovery and registration.
 pub trait Open3fsFile {
-    /// Opens a file in the 3fs filesystem.
+    /// Opens and registers a 3FS file using these open options.
     ///
-    /// # Arguments
-    /// * `path` - The path to the file to open
+    /// The [`std::fs::OpenOptions`] implementation canonicalizes the path after
+    /// opening it and caches the discovered mount point.
     ///
-    /// # Returns
-    /// * `Result<File>` - The opened 3fs file or an error
+    /// # Errors
+    ///
+    /// Returns [`Error::OpenFileFailed`] if opening fails,
+    /// [`Error::ExtractMountPointFailed`] if canonicalization or mount discovery
+    /// fails, or [`Error::RegisterFileFailed`] if registration fails. Creation
+    /// and truncation options take effect before mount discovery and registration.
     fn open_3fs_file<P: AsRef<Path>>(&self, path: P) -> Result<File>
     where
         Self: Sized;

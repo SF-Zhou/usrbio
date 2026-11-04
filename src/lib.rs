@@ -1,5 +1,7 @@
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+#![doc = include_str!("../README.md")]
 
+// Raw C bindings remain available alongside the owning Rust wrappers below.
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 mod file;
